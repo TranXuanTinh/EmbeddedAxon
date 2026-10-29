@@ -1,0 +1,47 @@
+[Unit]
+Description=AegisCam Connectivity, WireGuard Supervisor & Resumable Uploader (netagent)
+Documentation=file:///usr/share/doc/aegiscam/PROJECT_SPEC.md
+After=network-online.target aegisd.service
+Requires=aegisd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aegis-net
+Group=aegis
+ExecStart=/usr/bin/netagent -aegisd-sock /run/aegis/aegisd.sock -ingest-url https://ingest.aegis.internal
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+
+# Resource isolation so networking never starves real-time capture
+CPUWeight=50
+MemoryMax=64M
+Nice=10
+
+# Systemd sandboxing & privilege hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/var/lib/aegis/incidents
+ReadWritePaths=/run/aegis
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+
+[Install]
+WantedBy=multi-user.target

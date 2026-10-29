@@ -1,0 +1,28 @@
+**Reports to:** Sr. Engineering Manager / Engineering Director
+
+- Own the technical direction for the squad, translating product goals into a clear engineering strategy and driving architectural decisions for embedded software systems.
+- Lead design and architecture reviews for major components, features, and systems, holding a high bar on stability, performance, and safety-critical quality.
+- Write well-tested, maintainable code and lead technical design and code reviews that elevate standards across the team.
+- Mentor and coach middle and senior engineers, actively growing the next generation of technical leaders on the team.
+- Drive AI-assisted development practices within the squad, establishing quality gates, review protocols, and reusable workflows that make AI adoption practical and safe.
+- Collaborate closely with Product Management, Design, and cross-functional Engineering teams to deliver integrated solutions that delight customers.
+- Identify and integrate the latest open source technologies to advance product capabilities while maintaining reliability in a mission-critical environment.
+- Improve engineering processes, including long-term technical planning, sprint execution, and continuous operational readiness improvements.
+
+### **What You Bring**
+
+#### **Required Skills**
+
+- 10+ years experience of professional software development in C/C++, Go, Python and/or another systems programming language
+- Strong experience developing, debugging, and shipping embedded software on Linux-based or RTOS-based devices.
+- Demonstrated track record of building well-tested software, including unit, integration, and system-level testing.
+- 5+ years mentoring junior team members and/or leading small teams
+- Understanding of Computer Science fundamentals in data structures, algorithms, run-time analysis, object-oriented design and code quality verification
+- Networking knowledge (such as TCP/IP, VPN, DNS, DHCP, tunneling to support a diverse array of network configurations) is a plus
+
+#### **Preferred Qualifications**
+
+- Familiarity with Linux-based embedded environments and real-time constraints.
+- Experience working on consumer or professional hardware products with tight security, low latency and high stability requirements.
+- You follow the latest developments in embedded software and open source technologies, and can distinguish between promising new practices and passing trends.
+- Experience using AI-assisted development tools across the software development lifecycle, with a strong understanding of review, validation, and safety guardrails.

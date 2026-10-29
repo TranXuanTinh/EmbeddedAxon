@@ -1,0 +1,212 @@
+name: AegisCam CI Quality Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Gate 1: Formatting & Static Analysis (C++ clang-format/clang-tidy, Go gofmt/go vet)
+  format-and-lint:
+    name: "Gate 1: Format & Lint"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: netagent/go.mod
+
+      - name: Check C++ formatting (clang-format)
+        run: |
+          find core -type f \( -name '*.h' -o -name '*.cpp' \) -print0 \
+            | xargs -0 clang-format --dry-run -Werror
+
+      - name: Check Go formatting (gofmt) and vet
+        working-directory: netagent
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          go vet ./...
+
+      - name: Run clang-tidy on core
+        run: |
+          cmake --preset dev -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          run-clang-tidy -p build/dev 'core/src/.*\.cpp'
+
+  # Gate 2 & 3: Build Matrix (GCC + Clang, Debug + Release) & Unit/Integration Tests
+  cpp-build-and-test:
+    name: "Gate 2/3: C++ (${{ matrix.compiler }}, ${{ matrix.build_type }})"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        env:
+          CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DAEGIS_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run CTest unit & integration suite
+        run: ctest --test-dir build --output-on-failure
+
+  # Gate 2b: Cross-compilation check for aarch64-linux-gnu
+  cross-aarch64:
+    name: "Gate 2: Cross-Build (aarch64)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 cross-toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+      - name: Configure & Build aarch64 Release
+        run: |
+          cmake --preset release-aarch64
+          cmake --build --preset release-aarch64 --parallel
+
+  # Gate 3b: Go unit tests with race detector
+  go-test:
+    name: "Gate 3: Go netagent (go test -race)"
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: netagent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: netagent/go.mod
+
+      - name: Run tests with race detector
+        run: go test -race -v ./...
+
+  # Gate 4: Sanitizers (ASan+UBSan and TSan)
+  sanitizers:
+    name: "Gate 4: Sanitizer (${{ matrix.preset }})"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan-ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure & Build (${{ matrix.preset }})
+        run: |
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Run tests under ${{ matrix.preset }}
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          TSAN_OPTIONS: "halt_on_error=1"
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
+
+  # Gate 5: Line coverage >= 80% on crypto, evidence, recording, ota
+  coverage:
+    name: "Gate 5: Coverage >= 80%"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcovr
+        run: pip install --user gcovr
+
+      - name: Build & Run Coverage Preset
+        run: |
+          cmake --preset coverage
+          cmake --build --preset coverage --parallel
+          ctest --preset coverage --output-on-failure
+
+      - name: Enforce >= 80% line coverage on critical modules
+        run: |
+          python3 -m gcovr -r . build/coverage \
+            --filter 'core/src/(crypto|evidence|recording|ota)/' \
+            --fail-under-line 80 \
+            --print-summary
+
+  # Gate 6: 60-second libFuzzer smoke run on IPC command protocol
+  fuzz-smoke:
+    name: "Gate 6: libFuzzer (60s command_protocol)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Fuzz Target with Clang
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -B build-fuzz \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DAEGIS_ENABLE_FUZZ=ON \
+            -DAEGIS_BUILD_TESTS=OFF
+          cmake --build build-fuzz --target fuzz_command_protocol --parallel
+
+      - name: Run Fuzzer for 60 seconds
+        run: ./build-fuzz/core/fuzz_command_protocol -max_total_time=60
+
+  # Gate 7: End-to-end system tests (pytest + tools/verify_evidence.py)
+  system-tests:
+    name: "Gate 7: System E2E (pytest)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build aegisd (dev preset)
+        run: |
+          cmake --preset dev
+          cmake --build --preset dev --target aegisd --parallel
+
+      - name: Install pytest & run system tests
+        run: |
+          pip install --user -r tests/system/requirements.txt
+          AEGISD_BIN="$PWD/build/dev/core/aegisd" python3 -m pytest tests/system -v
+
+  # Gate 8: AI-Assisted Change Governance Gate
+  ai-governance-gate:
+    name: "Gate 8: AI Governance Check"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify AI-assisted disclosure & test coverage on PR
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$PR_BODY" | grep -qE '\[(x|X)\] This PR includes AI-assisted code'; then
+            echo "AI-assisted PR detected; verifying 'ai-assisted' label..."
+            if ! echo "$PR_LABELS" | grep -q '"ai-assisted"'; then
+              echo "::error::PR discloses AI-assisted code; please add the 'ai-assisted' label (requires 2 human approvals)."
+              exit 1
+            fi
+          fi

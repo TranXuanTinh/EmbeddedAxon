@@ -1,0 +1,53 @@
+[Unit]
+Description=AegisCam Real-Time Evidence Capture & Chain-of-Custody Daemon (aegisd)
+Documentation=file:///usr/share/doc/aegiscam/PROJECT_SPEC.md
+After=local-fs.target systemd-tmpfiles-setup.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=aegis
+Group=aegis
+SupplementaryGroups=video
+RuntimeDirectory=aegis
+RuntimeDirectoryMode=0750
+StateDirectory=aegis
+StateDirectoryMode=0700
+ExecStart=/usr/bin/aegisd --store /var/lib/aegis --device-id %H
+Restart=always
+RestartSec=1s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+
+# Real-time scheduling for capture (SCHED_FIFO 80) and watchdog supervisor (SCHED_FIFO 90)
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+
+# Systemd sandboxing & privilege hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=no
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/aegis /run/aegis /dev/watchdog0 /dev/video0
+DeviceAllow=/dev/watchdog0 rw
+DeviceAllow=/dev/video0 rw
+DeviceAllow=/dev/tpmrm0 rw
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @resources @io-event
+
+[Install]
+WantedBy=multi-user.target

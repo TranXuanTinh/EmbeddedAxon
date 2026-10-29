@@ -1,0 +1,92 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 16,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "Development (Debug + Tests)",
+      "binaryDir": "${sourceDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "AEGIS_BUILD_TESTS": "ON",
+        "AEGIS_WERROR": "ON"
+      }
+    },
+    {
+      "name": "asan-ubsan",
+      "displayName": "ASan + UBSan",
+      "binaryDir": "${sourceDir}/build/asan-ubsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "AEGIS_BUILD_TESTS": "ON",
+        "AEGIS_SANITIZER": "address;undefined",
+        "AEGIS_WERROR": "ON"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer",
+      "binaryDir": "${sourceDir}/build/tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "AEGIS_BUILD_TESTS": "ON",
+        "AEGIS_SANITIZER": "thread",
+        "AEGIS_WERROR": "ON"
+      }
+    },
+    {
+      "name": "coverage",
+      "displayName": "Code Coverage",
+      "binaryDir": "${sourceDir}/build/coverage",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "AEGIS_BUILD_TESTS": "ON",
+        "AEGIS_ENABLE_COVERAGE": "ON"
+      }
+    },
+    {
+      "name": "release-aarch64",
+      "displayName": "Release Cross-Compile (aarch64-linux-gnu)",
+      "binaryDir": "${sourceDir}/build/release-aarch64",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-aarch64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AEGIS_BUILD_TESTS": "OFF",
+        "AEGIS_WERROR": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "asan-ubsan", "configurePreset": "asan-ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "coverage", "configurePreset": "coverage" },
+    { "name": "release-aarch64", "configurePreset": "release-aarch64" }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "asan-ubsan",
+      "configurePreset": "asan-ubsan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
