@@ -1,198 +1,154 @@
-# System Design Document (SDD)
-## Project: Multi-Camera Edge AI Video Analytics on Jetson with NVIDIA DeepStream SDK (Yocto Linux & C++17)
+# System Design Document (SDD) — AegisCam Platform
+## Mission-Critical Body-Worn & In-Vehicle Evidence Camera System (Embedded Linux `PREEMPT_RT`, C++17 & Go 1.22)
+
+Tài liệu **System Design Document (SDD)** này định nghĩa kiến trúc tổng thể cấp hệ thống của **AegisCam**, bao gồm phân vùng phần cứng — phần mềm, ngân sách bộ nhớ RAM & Flash eMMC, luồng dữ liệu từ cảm biến đến đám mây qua hầm VPN WireGuard, kiến trúc bảo mật phần cứng (Secure Boot, `dm-verity`, TPM 2.0), và chiến lược chịu lỗi công nghiệp.
 
 ---
 
-## 1. Architectural Philosophy: The 3-Layer DeepStream Architecture
+## 1. Kiến Trúc Phân Tầng 3 Lớp & Phân Tách 2 Tiến Trình (3-Layer & Dual-Daemon Architecture)
 
-In accordance with embedded real-time standards (AUTOSAR, POSIX profiles, IEC 62443), the multi-camera vision application is partitioned into **3 strictly defined tiers**, wrapping NVIDIA DeepStream SDK within clean, testable abstractions:
+Tuân thủ các tiêu chuẩn phần mềm nhúng có độ tin cậy cao (POSIX.1b Real-Time Extensions, IEC 62443), AegisCam được phân tách theo **chiều dọc thành 2 tiến trình hệ điều hành độc lập** (`aegisd` C++17 và `netagent` Go 1.22) và theo **chiều ngang thành 3 tầng kiến trúc nghiêm ngặt**:
 
 ```
-+-------------------------------------------------------------------------------+
-| 1. APP LAYER (Business Logic & Orchestration)                                |
-|    - main.cpp (CLI Entry Point, POSIX Signals SIGINT/SIGTERM, Process Exit)   |
-|    - EdgeAIManager (Lifecycle, Multi-Camera DI, Orchestration)                |
-|    - Pipeline (Dual Mode: DeepStream Orchestration / Modular Service Pipeline)|
-|    - RuleEngine (Per-Camera Rules: Zone Intrusion, Line Crossing, Counting)   |
-+-----------------------------------^-------------------------------------------+
-                                    | calls only
-+-----------------------------------v-------------------------------------------+
-| 2. SERVICE LAYER (Platform-Independent Services)                              |
-|    - Video Analytics: CameraService, InferenceService, TrackerService         |
-|    - Processing: Preprocessor (Letterbox), Postprocessor (YOLOv8 NMS)         |
-|    - Tracking Math: KalmanFilter (8D State), Hungarian (Bipartite Matcher)    |
-|    - Infrastructure: EventBus (Pub/Sub), MqttService (Telemetry/Alerts)       |
-|    - Persistence & Health: StorageService (SQLite), HealthService, ConfigService|
-|    - Logging: LogService (spdlog thread-safe asynchronous logging)            |
-+-----------------------------------^-------------------------------------------+
-                                    | calls only
-+-----------------------------------v-------------------------------------------+
-| 3. HARDWARE ABSTRACTION LAYER - HAL (DeepStream & Driver Interfaces)          |
-|    - IDeepStreamHAL (nvstreammux batching, nvinfer PGIE, nvtracker, pad probe)|
-|    - ICameraHAL (MIPI CSI nvarguscamerasrc / USB V4L2)                        |
-|    - IGpuHAL (CUDA runtime memory, TensorRT execution context)                |
-|    - INetworkHAL (Paho MQTT), IStorageHAL (SQLite3 embedded)                  |
-|    - ISensorHAL (sysfs thermal/load), IWatchdogHAL (/dev/watchdog)            |
-|    - Jetson Implementations vs 100% Host PC Mock Implementations              |
-+-------------------------------------------------------------------------------+
++=======================================================================================+
+| TIẾN TRÌNH 1: aegisd (C++17 Real-Time Evidence Daemon)                                |
++---------------------------------------------------------------------------------------+
+| 1. APP & IPC LAYER (Orchestration & Command Protocol)                                 |
+|    - aegisd_main.cpp (CLI Parser, Async-Signal-Safe SIGINT/SIGTERM, Process Exit)     |
+|    - DeviceController (Master Lifecycle, Dependency Injection Container, Event Sink)  |
+|    - CommandProtocol (Line-Protocol Parser/Formatter, Fuzz-hardened)                  |
++-------------------------------------------^-------------------------------------------+
+                                            | calls downwards only
++-------------------------------------------v-------------------------------------------+
+| 2. DOMAIN & SERVICE LAYER (Platform-Independent Core Logic)                           |
+|    - Concurrency: SpscRingBuffer<Frame> (Lock-Free), BoundedQueue<T>                  |
+|    - Recording & Trigger: RecordingStateMachine (Table-Driven FSM), TriggerArbiter    |
+|    - Evidence Engine: PreEventBuffer (30s Keyframe Drain), SegmentWriter,             |
+|                       EvidenceStore (Manifest & Recovery), AuditLog (Hash-Chained)    |
+|    - Cryptography: Sha256 (FIPS 180-4), Hmac (RFC 2104), HashChain                    |
+|    - Reliability: AbSlotManager (A/B OTA Rollback), WatchdogSupervisor (Heartbeats)   |
++-------------------------------------------^-------------------------------------------+
+                                            | calls via pure interfaces
++-------------------------------------------v-------------------------------------------+
+| 3. HARDWARE ABSTRACTION LAYER - HAL (Linux Target Drivers vs Deterministic Sim HALs)  |
+|    - ICameraHal      : V4l2CameraHal (MMAP DMA)       | SimCameraHal (Synthetic GOP)  |
+|    - IStorageHal     : PosixStorageHal (tmp+fsync)    | SimStorageHal (Fault Inject)  |
+|    - IWatchdogHal    : LinuxWatchdogHal (/dev/watchdog)| SimWatchdogHal (Kick Counter)|
+|    - IKeyStoreHal    : TPM 2.0 / PKCS#11 KeyStore     | SimKeyStoreHal (Test Key)     |
+|    - IBootControlHal : U-Boot / fw_setenv Slot Store  | SimBootControlHal (JSON)      |
++===========================================^===========================================+
+                                            |
+              Unix Domain Socket (/run/aegis/aegisd.sock) + Shared RO Flash
+                                            |
++===========================================v===========================================+
+| TIẾN TRÌNH 2: netagent (Go 1.22 Connectivity, VPN & Resumable Upload Daemon)          |
+|    - internal/link     : Failover eth > wifi > lte với Hysteresis & Metered Policy    |
+|    - internal/dhcp     : RFC 2131 Lease State Machine (BOUND -> T1 Renew -> T2 Rebind)|
+|    - internal/dnscheck : Primary/Secondary DNS Failover & Captive Portal Detection    |
+|    - internal/vpn      : WireGuard Tunnel Supervisor & Upload Kill-Switch             |
+|    - internal/uploader : 4 MiB Resumable Chunked Upload, Token Bucket, Full-Jitter    |
++=======================================================================================+
 ```
 
-### Strict Layer Invariants:
-1. **Rule 1 (Downwards Invocation Only)**: The App Layer orchestrates through the Service and HAL interfaces. Higher layers never expose raw GStreamer / DeepStream C structs (`GstElement*`, `NvDsBatchMeta*`) to upper business rules.
-2. **Rule 2 (Upwards Delivery via Pad Probes & Event Bus)**: Frame metadata extracted inside the DeepStream Pad Probe (`GstPadProbeCallback`) is converted into clean C++ `PipelineResult` structures containing `camera_id` and `source_id`, and dispatched asynchronously via `EventBus`.
-3. **Rule 3 (Dual-Mode Execution)**: In production on Jetson, `JetsonDeepStreamHAL` harnesses NVIDIA NVMM hardware DMA memory. On Host PC / CI environments, `MockDeepStreamHAL` simulates multi-channel video streams, allowing 100% automated test coverage without needing physical cameras or NVIDIA hardware.
+### Ba Bất Biến Kiến Trúc (Strict Layer Invariants):
+1. **Bất biến 1 — Chỉ gọi từ trên xuống (Downward Invocation Only)**: Tầng Domain (`RecordingStateMachine`, `EvidenceStore`, `AbSlotManager`) hoàn toàn không chứa bất kỳ lời gọi hệ thống Linux (`open`, `ioctl`, `socket`) nào mà chỉ giao tiếp qua các giao diện thuần ảo ở tầng HAL.
+2. **Bất biến 2 — Cô lập Đặc quyền Tối thiểu (Least-Privilege Process Split)**: `aegisd` giữ quyền ghi duy nhất vào `/var/lib/aegis/incidents` nhưng không mở kết nối ra Internet; ngược lại `netagent` mở kết nối mạng nhưng chỉ được gắn kết `/var/lib/aegis/incidents` ở chế độ **Read-Only (`ReadOnlyPaths`)**.
+3. **Bất biến 3 — Thực thi Kép (Dual-Mode Execution)**: Cùng một mã nguồn `aegis_core` vừa biên dịch chéo cho ARM64 Yocto Linux (`cmake --preset release-aarch64`), vừa chạy mô phỏng tất định 100% trên máy tính phát triển (`aegisd --sim`) phục vụ kiểm thử tự động CI/CD.
 
 ---
 
-## 2. DeepStream Multi-Camera Pipeline Architecture
+## 2. Sơ Đồ Luồng Dữ Liệu Đầu-Cuối Toàn Hệ Thống (End-to-End Data Flow)
 
 ```mermaid
 flowchart LR
-    subgraph SOURCES["Multi-Source Input Ingestion"]
-        S0["Source 0: CSI Camera<br/>(nvarguscamerasrc)"]
-        S1["Source 1: RTSP IP Camera<br/>(nvurisrcbin / rtspsrc)"]
-        S2["Source 2: USB Camera<br/>(v4l2src / nvvidconv)"]
-        S3["Source N: Video File<br/>(filesrc / uridecodebin)"]
+    subgraph CAPTURE["1. Thu Nhận Thời Gian Thực"]
+        CAM["Sensor / V4L2<br/>(30 FPS, Keyframe/30)"]
+        RING["Lock-Free SpscRingBuffer<br/>(1024 slots, O(1))"]
+        PRE["PreEventBuffer<br/>(Cửa sổ trượt 30s)"]
+        CAM --> RING --> PRE
     end
 
-    subgraph DEEPSTREAM["NVIDIA DeepStream Hardware-Accelerated Pipeline"]
-        MUX["nvstreammux<br/>Hardware Batching (Batch Size = N)<br/>NVMM Zero-Copy Memory Allocation<br/>Dynamic Aspect-Ratio Scaling (VIC)"]
-        PGIE["nvinfer (Primary GIE)<br/>TensorRT FP16/INT8 Batch Inference<br/>YOLOv8 Object Detection Engine<br/>Hardware Colorspace Conversion"]
-        TRK["nvtracker (Multi-Stream Tracker)<br/>Hardware Multi-Object Tracking<br/>Persistent Object IDs per Source Pad<br/>NvDCF / ByteTrack Algorithm"]
-        PROBE["Pad Probe (GstPadProbeCallback)<br/>Zero-Copy NvDsBatchMeta Traversal<br/>FrameMeta & ObjectMeta Extraction<br/>Dispatches to C++ EventBus"]
-        TILE["nvmultistreamtiler<br/>Composites N streams into 2D Grid"]
-        OSD["nvdsosd<br/>Hardware Bounding Box & Label Drawing"]
-        SINK["Video Sink<br/>fakesink (Headless Edge)<br/>nveglglessink (HDMI Screen)"]
+    subgraph RECORD["2. Kích Hoạt & Đóng Gói Bằng Chứng"]
+        ARB["TriggerArbiter<br/>(Holster > Button > Signal > Remote)"]
+        FSM["RecordingStateMachine<br/>(Buffering -> Recording -> PostRecord)"]
+        SEG["SegmentWriter<br/>(seg_%06u.bin + SHA-256)"]
+        MAN["EvidenceStore<br/>(HashChain + HMAC manifest.json)"]
+        AUD["AuditLog<br/>(Append-Only Chained Log)"]
+        ARB --> FSM
+        PRE -->|"Drain từ I-Frame"| SEG
+        FSM --> SEG --> MAN
+        FSM --> AUD
     end
 
-    S0 -->|"sink_0"| MUX
-    S1 -->|"sink_1"| MUX
-    S2 -->|"sink_2"| MUX
-    S3 -->|"sink_N"| MUX
-    MUX -->|"NVMM Batched Surface"| PGIE
-    PGIE -->|"Batched Detections"| TRK
-    TRK --> PROBE
-    TRK --> TILE
-    TILE --> OSD
-    OSD --> SINK
-```
-
-### DeepStream Pipeline Key Elements:
-* **`nvurisrcbin` / `nvarguscamerasrc`**: Decodes camera video streams using hardware NVDEC (NVIDIA Video Decoder) or Tegra ISP directly into unified NVMM memory (`video/x-raw(memory:NVMM)`).
-* **`nvstreammux`**: Multiplexes $N$ asynchronous camera streams into a single batched NVMM tensor buffer with fixed width/height and configured timeout (`batched-push-timeout = 40000 µs`).
-* **`nvinfer`**: Executes batched TensorRT engine inference on NVIDIA Maxwell/Ampere/Orin GPU cores with zero host-to-device memory copies.
-* **`nvtracker`**: Maintains independent Kalman filter trajectories and Hungarian matching for each `source_id`, assigning globally consistent `object_id`s across continuous frames.
-* **Pad Probe**: Intercepts the GStreamer buffer downstream of `nvtracker`, extracting structured detection and tracking data without duplicating video memory.
-
----
-
-## 3. End-to-End Multi-Camera Data Flow
-
-```mermaid
-sequenceDiagram
-    participant CAM1 as Camera 1 (CSI)
-    participant CAM2 as Camera 2 (RTSP)
-    participant MUX as nvstreammux
-    participant PGIE as nvinfer (YOLOv8)
-    participant TRK as nvtracker
-    participant PROBE as Pad Probe Handler
-    participant PIPE as Pipeline (App)
-    participant RULE as RuleEngine (Per-Camera)
-    participant EBUS as EventBus
-    participant MQTT as MqttService
-    participant DB as StorageService (SQLite)
-
-    par Stream Ingestion
-        CAM1->>MUX: Push Frame (NV12 NVMM)
-        CAM2->>MUX: Push Frame (H.264 -> NVDEC)
+    subgraph STORAGE["3. Lưu Trữ Nguyên Tử (Flash eMMC)"]
+        DISK[("/var/lib/aegis/<br/>• audit.log<br/>• incidents/INC-.../<br/>• ota/slot_state.json")]
+        SEG -->|"write(.tmp) -> fsync -> rename"| DISK
+        MAN -->|"write(.tmp) -> fsync -> rename"| DISK
+        AUD -->|"append + fsync"| DISK
     end
 
-    MUX->>PGIE: Batched Buffer (Batch Size = 2)
-    PGIE->>PGIE: TensorRT FP16 Inference (GPU)
-    PGIE->>TRK: Raw Detections + NvDsBatchMeta
-    TRK->>TRK: Multi-stream Tracking Association
-    TRK->>PROBE: Buffer with Track IDs & BBoxes
-
-    loop For each FrameMeta in NvDsBatchMeta
-        PROBE->>PROBE: Extract source_id (0 -> cam_01, 1 -> cam_02)
-        PROBE->>PROBE: Construct PipelineResult(camera_id, objects)
-        PROBE->>PIPE: onDeepStreamMetadata(PipelineResult)
-        PIPE->>RULE: evaluate(objects, camera_id)
-        
-        opt Rule Violated on Camera
-            RULE->>EBUS: publish(ALERT, AlertPayload)
-        end
-        
-        PIPE->>EBUS: publish(TRACKED_OBJECTS, PipelineResult)
+    subgraph UPLOAD["4. Truyền Tải An Toàn Qua VPN (netagent)"]
+        NET["Link + DHCP + DNS<br/>(eth > wifi > lte)"]
+        WG["WireGuard Supervisor<br/>(Kill-Switch)"]
+        UP["Resumable Uploader<br/>(HEAD offset -> PATCH 4 MiB)"]
+        DISK -->|"Read-Only"| UP
+        NET --> WG -->|"AllowTraffic()"| UP
     end
 
-    par Asynchronous Fan-Out
-        EBUS->>MQTT: publishDetections(camera_id, objects)
-        EBUS->>DB: recordDetection(camera_id, frame_id, objects)
+    subgraph CLOUD["5. Cloud & Kiểm Định Pháp Y"]
+        API["Evidence Cloud Server"]
+        VER["tools/verify_evidence.py"]
+        UP -->|"HTTPS over WireGuard"| API
+        DISK -.->|"Kiểm định ngoại tuyến"| VER
     end
 ```
 
 ---
 
-## 4. Multi-Camera Concurrency & Threading Model
+## 3. Ngân Sách Bộ Nhớ RAM & Bộ Nhớ Flash (Memory & Storage Budget)
 
-The multi-camera DeepStream runtime operates within a single high-performance process leveraging **GStreamer native pipeline threads and application worker threads**:
+Thiết bị nhúng mục tiêu được trang bị **RAM LPDDR4 512 MB – 1 GB** và **Flash eMMC 32 GB – 64 GB** (cấu hình phân vùng kép A/B). Ngân sách bộ nhớ được hoạch định tĩnh:
 
-| Thread ID | Thread Name | Owner | Role & Priority | Execution Frequency |
-|---|---|---|---|---|
-| **T1** | **Main App Thread** | `EdgeAIManager` | Initialization, signal handling, periodic liveness checks | Periodic sleep (50ms) |
-| **T2..k** | **Source Streaming Threads** | GStreamer `nvurisrcbin` | Ingests RTSP/CSI RTP packets and runs hardware NVDEC decode | 30 FPS per camera |
-| **Tk+1** | **StreamMux Collector** | `nvstreammux` | Assembles frames from $N$ pads into batched buffer | 25 - 30 FPS batch rate |
-| **Tk+2** | **DeepStream Pipeline Worker**| `nvinfer` & `nvtracker` | Runs TensorRT GPU inference & NvDCF tracking kernel | 25 - 30 FPS batch rate |
-| **Tk+3** | **Pad Probe Dispatcher** | GStreamer Pad Probe | Traverses `NvDsBatchMeta` and calls C++ `PipelineResult` callback | Synchronous with batch completion |
-| **Tk+4** | **EventBus Dispatcher** | `EventBus` | Decouples video analytics from network and disk I/O | Event-driven (CV notify) |
-| **Tk+5** | **Storage Writer** | `StorageService` | Executes SQLite batch transactions with `camera_id` indexing | Every 5 sec or 50 records |
-| **Tk+6** | **MQTT Network Worker** | `MqttService` | Asynchronous TCP/TLS publish with per-camera topic routing | Async socket loop |
-| **Tk+7** | **Health & Watchdog** | `HealthService` | Monitors CPU/GPU temperatures and resets hardware `/dev/watchdog` | Every 30 seconds |
+### 3.1 Ngân sách RAM lúc chạy (Runtime RAM Budget)
 
----
+| Thành phần | Dung lượng cấp phát | Cơ chế giới hạn (Bounded Mechanism) |
+|---|---|---|
+| **Nhân Linux `PREEMPT_RT` + `systemd` + WireGuard module** | $\approx 64\text{ MB}$ | Cấu hình nhân tối giản [`aegis-rt.cfg`](../../deploy/yocto/meta-aegiscam/recipes-kernel/linux/files/aegis-rt.cfg) |
+| **`aegisd` — `SpscRingBuffer<Frame>` (1024 slots)** | $\approx 16\text{ MB}$ | Cố định lúc khởi tạo (`kDefaultCapacity = 1024`), khóa trong RAM bằng `mlockall()` |
+| **`aegisd` — `PreEventBuffer` (30 giây @ 30 FPS = 900 frames)** | $\approx 45\text{ MB}$ | Cắt cửa sổ trượt theo cả thời gian (`window_ms = 30000`) và số khung tối đa (`max_frames = 8192`) |
+| `aegisd` — Vùng đệm cắt phân đoạn 10 giây (`current_segment_frames_`) | $\approx 15\text{ MB}$ | Được giải phóng (`clear()`) mỗi `segment_ms = 10000 ms` ngay sau khi `write_file_atomic` hoàn tất |
+| **`netagent` — Go Runtime + 2 Chunk Buffers (2 × 4 MiB)** | $\le 64\text{ MB}$ | Khống chế bởi `MaxInFlight = 2`, `ChunkSize = 4 MiB` và cgroup `MemoryMax=64M` trong [`netagent.service`](../../deploy/systemd/netagent.service) |
+| **Tổng mức sử dụng RAM toàn hệ thống** | **$\approx 204\text{ MB}$** | **Dư $> 300\text{ MB}$ an toàn trên hệ thống 512 MB RAM (Không bao giờ OOM)** |
 
-## 5. Multi-Camera Memory & Performance Budget (Jetson Platforms)
+### 3.2 Sơ đồ Phân vùng Bộ nhớ Flash eMMC (A/B Partition Layout)
 
-### 5.1 Performance Comparison: Legacy Manual Pipeline vs. DeepStream Multi-Camera
-
-| Metric | Legacy Single-Camera (CPU Copy) | DeepStream 2-Camera (Jetson Nano) | DeepStream 4-Camera (Jetson Orin Nano) |
-|---|---|---|---|
-| **Cameras Supported** | 1 Channel | 2 Channels | 4 - 8 Channels |
-| **Capture Latency** | 33 ms (CPU V4L2) | < 5 ms (Zero-copy NVMM) | < 3 ms (NVDEC Hardware) |
-| **Pre-process Latency** | 5 - 6 ms (OpenCV CPU) | 0 ms (Hardware VIC scaling) | 0 ms (Hardware VIC scaling) |
-| **Batch Inference (FP16)** | 42 ms (Batch = 1) | 48 ms (Batch = 2) | 18 ms (Batch = 4 Orin DLA/GPU) |
-| **Post-process & Tracking**| 3 - 5 ms (CPU NMS) | 2 ms (NvTracker GPU/Hardware) | 2 ms (NvTracker) |
-| **Total System FPS** | 19 - 22 FPS (1 cam) | **2 x 25 - 30 FPS (50-60 FPS total)** | **4 x 30 FPS (120 FPS total)** |
-| **CPU Core Utilization** | 35% - 45% (1 cam) | **20% - 30% (2 cams)** | **15% - 25% (4 cams)** |
-| **RAM Footprint** | ~720 MB | ~850 MB (NVMM shared) | ~1.2 GB |
-| **Available RAM Margin** | > 3.1 GB Free | **> 3.0 GB Free** | **> 6.5 GB Free** |
-
-### 5.2 Two-Tier Resource Governance Model
-
-Rather than statically dividing CPU and GPU percentages per camera, the system governs resources across two logical tiers:
-1. **Pipeline-Level (Global Shared Infrastructure)**:
-   * **GPU Saturation**: Monitored at the batched inference level (`nvinfer` execution over $[B, 3, 640, 640]$ tensors).
-   * **Unified RAM Shared Footprint**: OS rootfs, TensorRT engine deserialized weights, CUDA device context, and `nvstreammux` surface pools.
-   * **Global Batch FPS & End-to-End Latency**: Measured across the entire batched pipeline graph.
-2. **Per-Camera Level (Channel-Specific Telemetry & Buffering)**:
-   * **Buffers & Queues**: Independent CSI capture pools, RTSP jitter buffers, bounded event queues, and tracking/rule states.
-   * **Runtime Channel Telemetry**: `input_fps`, `processed_fps`, `dropped_frames`, `last_pts` (stagnation detection), `decode_latency_ms`, and `active_objects`.
+```
+eMMC Flash (32 GB)
++-----------------------------------------------------------------------+
+| Bootloader Partition (SPL / TF-A / U-Boot + Redundant Env)     [16 MB]|
++-----------------------------------------------------------------------+
+| RootFS Slot A (Read-Only SquashFS + dm-verity Merkle Tree)    [512 MB]|
++-----------------------------------------------------------------------+
+| RootFS Slot B (Read-Only SquashFS + dm-verity Merkle Tree)    [512 MB]|
++-----------------------------------------------------------------------+
+| Evidence & Persistent Data Partition (/var/lib/aegis - ext4/f2fs)     |
+|   ├── audit.log (Append-only SHA-256 hash chain)                      |
+|   ├── ota/slot_state.json (Active/Pending slot & boot counter)        |
+|   └── incidents/INC-<dev>-<ts>/ (seg_*.bin + signed manifest.json)    |
+|   [Dung lượng: ~30.5 GB -> Lưu trữ > 24 giờ video Full HD H.264/H.265] |
++-----------------------------------------------------------------------+
+```
 
 ---
 
-## 6. Key Advantages & Verified Safety Standards
+## 4. Chiến Lược Chịu Lỗi & Tự Phục Hồi (Fault-Tolerance & Self-Healing Matrix)
 
-The architecture strictly fulfills the **10 production safety & reliability criteria** for edge multi-camera systems:
-
-1. **Non-blocking Pad Probe**: Metadata extraction runs in $< 0.05\,\text{ms}$, dispatching asynchronously to `EventBus` without calling network or disk I/O.
-2. **Strictly Bounded Queues**: `EventBus` (256 ring buffer), `MqttService` offline queue (500 messages), and `StorageService` in-memory write queue (1000 records) all enforce bounded limits to prevent OOM on 4GB Unified RAM.
-3. **Synchronized Batch Sizing**: Uniform `batch-size: 2` across `app_config.yaml`, `nvstreammux`, and `deepstream_pgie_config.txt` (`nvinfer`).
-4. **Preserved Request Pads on Reconnect**: `nvurisrcbin` with `rtsp-reconnect-interval` manages reconnects internally without releasing or reallocating `sink_%u` pads on `nvstreammux`.
-5. **Channel-Isolated EOS Handling**: EOS from a single camera is logged on `GstBus` without stopping the global pipeline or interfering with active channels.
-6. **Compound Keying in Rule State**: All tracking state in `CountingRule` and `ZoneRule` is keyed by `std::pair<std::string, int>` (`[camera_id, track_id]`), completely preventing cross-camera ID collision.
-7. **Source Reconnect State Purge**: `resetCameraState(camera_id)` clears tracking coordinates and cooldown timers when a camera reconnects, preventing false tripwire triggers.
-8. **Zero-Copy Hardware Memory (NVMM)**: Raw video frames flow exclusively through hardware ASICs (ISP, NVDEC, VIC) and GPU memory without copying pixels to CPU RAM.
-9. **Lightweight GstBus Callback**: GstBus error/warning callbacks only format messages and return immediately ($< 5\,\mu\text{s}$), preventing main loop stalls.
-10. **Deterministic 4-Phase Graceful Shutdown**: Ingress halt $\to$ Queue drain $\to$ Storage commit & MQTT disconnect $\to$ Hardware Watchdog safe release ('V').
+| Sự cố phần cứng / môi trường | Tác động tiềm ẩn | Cơ chế bảo vệ & Tự phục hồi trong AegisCam |
+|---|---|---|
+| **Rút pin / sập nguồn đột ngột khi đang ghi** | Hỏng tệp video đang ghi hoặc mất toàn bộ phiên ghi | Video được chia nhỏ mỗi 10s (`seg_%06u.bin`); ghi qua `.tmp` + `fsync` + `rename` nguyên tử. Khi bật lại, `EvidenceStore::recover()` dọn tệp `.tmp` và giữ nguyên toàn bộ các phân đoạn đã niêm phong trước đó |
+| **Đầy bộ nhớ Flash (`StorageFull`)** | Ghi đè làm hỏng bằng chứng cũ hoặc crash daemon | `IStorageHal` báo lỗi `kIoError`/`StorageFull` $\rightarrow$ `RecordingStateMachine` tự động cắt phân đoạn hiện tại, niêm phong `manifest.json` (`SealIncident`) và chuyển sang trạng thái an toàn `Fault` |
+| **Một luồng bị treo (Deadlock / I/O hang)** | Tiến trình vẫn tồn tại nhưng không ghi hình được | `WatchdogSupervisor` kiểm tra `deadline_ms = 5000 ms` của từng luồng (`capture`, `controller`, `writer`). Nếu 1 luồng quá hạn, Supervisor ngừng đá `/dev/watchdog` để phần cứng reset bo mạch |
+| **Bản cập nhật Firmware OTA bị lỗi lúc khởi động** | Thiết bị biến thành "cục gạch" (Bricked) ngoài hiện trường | `AbSlotManager` đặt `boot_attempts_left = 3` cho phân vùng mới. Sau 3 lần khởi động mà chưa vượt qua tự kiểm tra để gọi `mark_good()`, tự động rollback về phân vùng cũ |
+| **Mạng Wi-Fi/LTE chập chờn hoặc đi vào đường hầm** | Đứt kết nối TCP giữa chừng khi đang tải tệp lớn | `netagent` dùng Resumable Upload (`HEAD` hỏi offset + `PATCH` từng mảnh 4 MiB) kết hợp Full-Jitter Exponential Backoff; không bao giờ phải tải lại từ byte 0 |
+| **Wi-Fi công cộng giả mạo DNS / Captive Portal** | Rò rỉ thông tin hoặc treo kết nối tải lên | `dnscheck.Checker` kiểm tra tiền tố IP kỳ vọng của tên miền Canary và `vpn.Supervisor` bật Kill-Switch chặn tải lên nếu hầm WireGuard chưa bắt tay mật mã thành công |
 

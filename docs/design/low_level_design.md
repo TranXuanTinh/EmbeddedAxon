@@ -1,458 +1,315 @@
-# Low-Level Design Document (LLD)
-## Project: Multi-Camera Edge AI Video Analytics on Jetson with NVIDIA DeepStream SDK
+# Low-Level Design Document (LLD) — AegisCam Platform
+## Detailed Data Structures, Lock-Free Memory Layouts, State Machines, Cryptographic Formulas & Networking Algorithms
+
+Tài liệu **Low-Level Design (LLD)** này đi sâu vào mức cài đặt chi tiết của từng cấu trúc dữ liệu, bố cục bộ nhớ (Memory Layout), thứ tự bộ nhớ nguyên tử (`std::memory_order`), ma trận chuyển trạng thái, công thức mật mã học (SHA-256, HMAC, Hash Chain), định dạng nhị phân trên đĩa của **`aegisd` (C++17)** và các thuật toán mạng cốt lõi của **`netagent` (Go 1.22)**.
 
 ---
 
-## 1. Core Data Structures (`types.h`)
+## 1. Cấu Trúc Dữ Liệu Nền Tảng & Xử Lý Lỗi Không Exception (`core/include/aegis/common/`)
 
-### 1.1 Coordinates & Bounding Box
-```cpp
-struct BBox {
-    float x{0.0f};  // Top-left x in pixels
-    float y{0.0f};  // Top-left y in pixels
-    float w{0.0f};  // Box width in pixels
-    float h{0.0f};  // Box height in pixels
-
-    float centerX() const { return x + w * 0.5f; }
-    float centerY() const { return y + h * 0.5f; }
-    float area() const { return std::max(0.0f, w) * std::max(0.0f, h); }
-
-    float iou(const BBox& o) const {
-        float x1 = std::max(x, o.x);
-        float y1 = std::max(y, o.y);
-        float x2 = std::min(x + w, o.x + o.w);
-        float y2 = std::min(y + h, o.y + o.h);
-        float interArea = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
-        float unionArea = area() + o.area() - interArea;
-        return (unionArea <= 0.0f) ? 0.0f : (interArea / unionArea);
-    }
-};
-```
-
-### 1.2 Multi-Camera Object Detection & Tracking State
-```cpp
-struct Detection {
-    BBox bbox;
-    float confidence{0.0f};
-    int class_id{-1};
-    std::string class_name;
-    std::string camera_id{"cam_0"};
-    int source_id{0};
-};
-
-enum class TrackState : uint8_t { New = 0, Confirmed = 1, Lost = 2, Removed = 3 };
-
-struct TrackedObject {
-    int track_id{-1};
-    Detection det;
-    TrackState state{TrackState::New};
-    float vx{0.0f};              // Horizontal velocity (px/frame)
-    float vy{0.0f};              // Vertical velocity (px/frame)
-    int age{0};                  // Total frames since track creation
-    int hits{0};                 // Total frames matched
-    int time_since_update{0};    // Frames since last association
-    std::string camera_id{"cam_0"};
-    int source_id{0};
-};
-```
-
-### 1.3 Multi-Camera Pipeline Result & Alerts
-```cpp
-struct PipelineResult {
-    uint64_t frame_id{0};
-    std::string camera_id{"cam_0"};
-    int source_id{0};
-    uint32_t batch_size{1};
-    float inference_ms{0.0f};
-    float fps{0.0f};
-    std::vector<TrackedObject> objects;
-    std::vector<Alert> alerts;
-};
-
-struct Alert {
-    std::string id;
-    std::string camera_id{"cam_0"};
-    int source_id{0};
-    std::string rule_id;
-    std::string rule_name;
-    std::string severity;   // "info", "medium", "high", "critical"
-    std::string message;
-    TrackedObject trigger;
-    std::chrono::system_clock::time_point timestamp;
-};
-
-struct CameraRuntimeMetrics {
-    std::string camera_id{"cam_0"};
-    int source_id{0};
-    float input_fps{0.0f};
-    float processed_fps{0.0f};
-    uint64_t dropped_frames{0};
-    uint64_t last_pts{0};             // Nanosecond Presentation Time Stamp
-    float decode_latency_ms{0.0f};
-    size_t result_queue_depth{0};
-    size_t active_objects{0};
-};
-
-struct HealthStatus {
-    float cpu_usage{0.0f};
-    float cpu_temp{0.0f};
-    float gpu_usage{0.0f};
-    float gpu_temp{0.0f};
-    uint64_t ram_used_mb{0};
-    uint64_t ram_total_mb{0};
-    float disk_usage_pct{0.0f};
-    float avg_fps{0.0f};
-    float avg_latency_ms{0.0f};
-    std::string status{"healthy"}; // "healthy", "warning", "critical"
-    std::vector<CameraRuntimeMetrics> camera_metrics;
-};
-```
-
----
-
-## 2. DeepStream Metadata Traversal Specification
-
-Inside the GStreamer Pad Probe callback (`GST_PAD_PROBE_TYPE_BUFFER`), zero-copy metadata traversal is performed via DeepStream C APIs:
+### 1.1 `ErrorCode`, `Status` và `Result<T>` ([`result.h`](../../core/include/aegis/common/result.h))
+Trên luồng thu nhận thời gian thực (`SCHED_FIFO`), C++ Exceptions bị cấm vì cơ chế stack unwinding tiêu tốn thời gian không xác định (non-deterministic latency) và làm phình kích thước bảng `.eh_frame`. Toàn bộ hàm có thể thất bại trả về `Status` hoặc `Result<T>`:
 
 ```cpp
-void JetsonDeepStreamHAL::handlePadProbe(GstBuffer* buf) {
-    // 1. Retrieve top-level batch metadata
-    NvDsBatchMeta* batch_meta = gst_buffer_get_nvds_batch_meta(buf);
-    if (!batch_meta) return;
+namespace aegis::common {
 
-    // 2. Iterate across frames in the current batch
-    for (NvDsMetaList* l_frame = batch_meta->frame_meta_list; l_frame != nullptr; l_frame = l_frame->next) {
-        NvDsFrameMeta* frame_meta = reinterpret_cast<NvDsFrameMeta*>(l_frame->data);
-        if (!frame_meta) continue;
+enum class ErrorCode {
+  kOk = 0,
+  kParseError,
+  kInvalidArgument,
+  kInvalidState,
+  kIoError,
+  kIntegrityError,
+  kNotSupported,
+  kTimeout,
+  kFull,
+  kEmpty,
+};
 
-        int src_id = frame_meta->source_id;
-        std::string cam_id = source_id_to_cam_id_[src_id];
-
-        PipelineResult res;
-        res.camera_id  = cam_id;
-        res.source_id  = src_id;
-        res.frame_id   = frame_meta->frame_num;
-        res.batch_size = batch_meta->num_frames_in_batch;
-        res.fps        = 30.0f;
-
-        // 3. Iterate across detected & tracked objects within the frame
-        for (NvDsMetaList* l_obj = frame_meta->obj_meta_list; l_obj != nullptr; l_obj = l_obj->next) {
-            NvDsObjectMeta* obj_meta = reinterpret_cast<NvDsObjectMeta*>(l_obj->data);
-            if (!obj_meta) continue;
-
-            TrackedObject tobj;
-            tobj.camera_id = cam_id;
-            tobj.source_id = src_id;
-            tobj.track_id  = static_cast<int>(obj_meta->object_id);
-            tobj.state     = TrackState::Confirmed;
-
-            tobj.det.camera_id  = cam_id;
-            tobj.det.source_id  = src_id;
-            tobj.det.class_id   = obj_meta->class_id;
-            tobj.det.confidence = obj_meta->confidence;
-            if (obj_meta->obj_label) {
-                tobj.det.class_name = obj_meta->obj_label;
-            }
-
-            tobj.det.bbox.x = obj_meta->rect_params.left;
-            tobj.det.bbox.y = obj_meta->rect_params.top;
-            tobj.det.bbox.w = obj_meta->rect_params.width;
-            tobj.det.bbox.h = obj_meta->rect_params.height;
-
-            res.objects.push_back(tobj);
-        }
-
-        // 4. Invoke user callback (Thread-safe dispatch)
-        if (cb_) {
-            cb_(res);
-        }
-    }
-}
-```
-
----
-
-## 3. Video Analytics Services Algorithms (Modular Path)
-
-### 3.1 Preprocessor (Letterbox Transform)
-To adapt arbitrary camera resolutions (e.g. $1280 \times 720$) into YOLOv8 input size ($640 \times 640$) without distortion:
-1. Scale ratio $r = \min\left(\frac{640}{W}, \frac{640}{H}\right)$.
-2. Scaled dimensions: $w_{\text{scaled}} = W \times r$, $h_{\text{scaled}} = H \times r$.
-3. Offsets: $dx = (640 - w_{\text{scaled}}) / 2$, $dy = (640 - h_{\text{scaled}}) / 2$.
-4. Normalization and CHW formatting:
-   $$\text{tensor}[c, y, x] = \frac{\text{pixel}[y, x, c]}{255.0}$$
-
-### 3.2 Postprocessor (YOLOv8 Output Tensor Decoding)
-The YOLOv8 ONNX model outputs tensor shape $(1, 84, 8400)$:
-* 84 rows = 4 bounding box coordinates $[cx, cy, w, h] + 80$ COCO class scores.
-* 8400 columns = candidate anchor points.
-Decoding logic:
-1. For each candidate $j \in [0, 8399]$:
-   * Find class score $S_{\max} = \max_{k \in [0, 79]} \text{score}[k, j]$ and class index $C$.
-   * If $S_{\max} < \text{confidence\_threshold}$, reject.
-2. Unletterbox bounding box:
-   $$x = \frac{cx - w/2 - dx}{r}, \quad y = \frac{cy - h/2 - dy}{r}, \quad w' = \frac{w}{r}, \quad h' = \frac{h}{r}$$
-3. Apply Non-Maximum Suppression (NMS) with IoU threshold $= 0.50$.
-
-### 3.3 TrackerService (ByteTrack with Kalman Filter & Hungarian)
-* **Kalman Filter**: Tracks 8D state vector $[x, y, a, h, \dot{x}, \dot{y}, \dot{a}, \dot{h}]^T$ where $a = w/h$ is aspect ratio.
-* **Two-Stage Association**:
-  * Stage 1: Associate confirmed tracks with high-confidence detections ($S \ge 0.5$) using Hungarian assignment on $1 - \text{IoU}$ cost matrix.
-  * Stage 2: Associate remaining unconfirmed tracks with low-confidence detections ($0.1 \le S < 0.5$) to maintain tracks through partial occlusions.
-
----
-
-## 4. Mathematical Domain Rules
-
-### 4.1 Ray-Casting Polygon Point-in-Polygon (`ZoneRule`)
-Determines whether point $(x, y)$ is enclosed within an arbitrary $n$-vertex polygon $P = [v_0, v_1, \dots, v_{n-1}]$:
-```cpp
-bool isPointInsidePolygon(const cv::Point2f& pt, const std::vector<cv::Point2f>& poly) {
-    bool inside = false;
-    size_t n = poly.size();
-    for (size_t i = 0, j = n - 1; i < n; j = i++) {
-        if (((poly[i].y > pt.y) != (poly[j].y > pt.y)) &&
-            (pt.x < (poly[j].x - poly[i].x) * (pt.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)) {
-            inside = !inside;
-        }
-    }
-    return inside;
-}
-```
-
-* **Per-Camera Cooldown Isolation**: Cooldown timers are tracked per camera channel to prevent one camera's alert from freezing detection on adjacent channels:
-  ```cpp
-  std::map<std::string, std::chrono::steady_clock::time_point> last_alert_time_per_cam_;
-  ```
-* **State Reset on Source Reconnect**:
-  ```cpp
-  void ZoneRule::resetCameraState(const std::string& camera_id) {
-      last_alert_time_per_cam_.erase(camera_id);
+class Status {
+ public:
+  static Status Ok() noexcept { return Status(); }
+  static Status Error(ErrorCode code, std::string message) {
+    return Status(code, std::move(message));
   }
-  ```
+  bool ok() const noexcept { return code_ == ErrorCode::kOk; }
+  ErrorCode code() const noexcept { return code_; }
+  const std::string& message() const noexcept { return message_; }
+ private:
+  ErrorCode code_{ErrorCode::kOk};
+  std::string message_;
+};
 
-### 4.2 2D Vector Cross-Product (`CountingRule`)
-Determines which side of directed segment $\vec{AB}$ point $C$ lies on:
-$$\text{crossProduct}(A, B, C) = (B_x - A_x) \times (C_y - A_y) - (B_y - A_y) \times (C_x - A_x)$$
-* If $\text{sign}(\text{crossProduct}_{t-1}) \neq \text{sign}(\text{crossProduct}_t)$, the object crossed the tripwire during the frame transition.
+template <typename T>
+class Result {
+ public:
+  static Result<T> Ok(T value);
+  static Result<T> Error(ErrorCode code, std::string message);
+  bool ok() const noexcept { return storage_.index() == 0; }
+  const Status& status() const noexcept;
+  T& value() & { return std::get<0>(storage_); }
+  const T& value() const& { return std::get<0>(storage_); }
+ private:
+  std::variant<T, Status> storage_;
+};
 
-* **Compound Keying (`cameraId + trackId`)**: In multi-camera DeepStream, `track_id` values are allocated per stream and may overlap across cameras. To eliminate state collision and false cross-camera counts, state is keyed by a compound pair:
-  ```cpp
-  std::map<std::pair<std::string, int>, float> previous_side_;
-  // Key: std::make_pair(obj.camera_id, obj.track_id)
-  ```
-* **Camera Reconnect Reset**: Clears tracking history when a camera drops or restarts to prevent false tripwire activations:
-  ```cpp
-  void CountingRule::resetCameraState(const std::string& camera_id) {
-      for (std::map<std::pair<std::string, int>, float>::iterator it = previous_side_.begin();
-           it != previous_side_.end(); ) {
-          if (it->first.first == camera_id) {
-              it = previous_side_.erase(it);
-          } else {
-              ++it;
-          }
-      }
+}  // namespace aegis::common
+```
+
+### 1.2 Đồng Hồ Trừu Tượng Tất Định (`IClock`, `SystemClock`, `FakeClock` — [`clock.h`](../../core/include/aegis/common/clock.h))
+```cpp
+class IClock {
+ public:
+  virtual ~IClock() = default;
+  virtual uint64_t now_ms() const noexcept = 0;
+};
+
+class FakeClock final : public IClock {
+ public:
+  explicit FakeClock(uint64_t initial_ms = 1700000000000ULL) noexcept
+      : now_ms_(initial_ms) {}
+  uint64_t now_ms() const noexcept override {
+    return now_ms_.load(std::memory_order_acquire);
   }
-  ```
+  void advance(uint64_t delta_ms) noexcept {
+    now_ms_.fetch_add(delta_ms, std::memory_order_acq_rel);
+  }
+ private:
+  std::atomic<uint64_t> now_ms_;
+};
+```
 
 ---
 
-## 5. SQLite Multi-Camera Storage Schema & Bounded RAM Queue
+## 2. Cấu Trúc Đồng Thời Lock-Free & Bounded Memory (`core/include/aegis/util/`)
 
-```sql
-CREATE TABLE IF NOT EXISTS detections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    camera_id TEXT NOT NULL DEFAULT 'cam_0',
-    frame_id INTEGER NOT NULL,
-    track_id INTEGER,
-    class_name TEXT NOT NULL,
-    class_id INTEGER NOT NULL,
-    confidence REAL NOT NULL,
-    bbox_x REAL NOT NULL,
-    bbox_y REAL NOT NULL,
-    bbox_w REAL NOT NULL,
-    bbox_h REAL NOT NULL
-);
+### 2.1 Lock-Free Single-Producer Single-Consumer Ring Buffer ([`spsc_ring_buffer.h`](../../core/include/aegis/util/spsc_ring_buffer.h))
 
-CREATE TABLE IF NOT EXISTS alerts (
-    id TEXT PRIMARY KEY,
-    camera_id TEXT NOT NULL DEFAULT 'cam_0',
-    rule_id TEXT NOT NULL,
-    rule_name TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    message TEXT NOT NULL,
-    track_id INTEGER,
-    class_name TEXT
-);
+#### Bố cục bộ nhớ & Chống False Sharing (Cache-Line Padding)
+Trên vi xử lý đa nhân ARM Cortex-A53/A55 (chiều dài dòng cache L1 là 64 byte), nếu biến chỉ số ghi (`head_`) của luồng Producer (Core 3) và biến chỉ số đọc (`tail_`) của luồng Consumer (Core 1) nằm trên cùng một dòng cache 64 byte, giao thức đồng bộ cache MESI/MOESI sẽ làm vô hiệu hóa dòng cache qua lại liên tục (**False Sharing**). Do đó, `head_` và `tail_` được căn chỉnh `alignas(64)`:
 
-CREATE INDEX IF NOT EXISTS idx_det_timestamp ON detections(timestamp);
-CREATE INDEX IF NOT EXISTS idx_det_track ON detections(track_id);
-CREATE INDEX IF NOT EXISTS idx_det_camera ON detections(camera_id);
+```
++-------------------------------------------------------------------+
+| Cache Line 0 (64B): slots_ vector metadata, capacity_, mask_      |
++-------------------------------------------------------------------+
+| Cache Line 1 (64B): alignas(64) std::atomic<size_t> head_         | <-- Producer (Capture Thread) ghi
++-------------------------------------------------------------------+
+| Cache Line 2 (64B): alignas(64) std::atomic<size_t> tail_         | <-- Consumer (Controller/Writer) ghi
++-------------------------------------------------------------------+
 ```
 
-### 5.1 Bounded RAM Queue Protection (Backpressure)
-To prevent disk write stalls from exhausting Jetson Nano's 4GB RAM, in-memory writes are bounded at 1,000 records using a FIFO ring-buffer policy:
+#### Thuật toán & Chứng minh Thứ tự Bộ nhớ (`acquire` / `release`)
+* **Dung lượng (`capacity_`)**: Luôn là lũy thừa của 2 ($2^k$, ví dụ $1024$), cho phép thay phép chia lấy dư `% capacity_` (tốn 15–20 chu kỳ CPU) bằng phép toán bit `& mask_` (`mask_ = capacity_ - 1`, tốn 1 chu kỳ CPU).
+* **`try_push(T item)` (Chỉ gọi bởi Producer)**:
+  1. Đọc `head` bằng `memory_order_relaxed` (vì chỉ Producer mới sửa `head_`).
+  2. Đọc `tail` bằng `memory_order_acquire` để thấy các vị trí đã được Consumer giải phóng.
+  3. Nếu `next_head == tail` $\rightarrow$ vòng đệm đầy, trả về `false` ngay lập tức (O(1), không chặn).
+  4. Ghi `slots_[head] = std::move(item)`.
+  5. Cập nhật `head_.store(next_head, std::memory_order_release)` — đảm bảo dữ liệu trong `slots_[head]` đã nằm trong bộ nhớ trước khi Consumer nhìn thấy `next_head`.
+* **`try_pop(T& out)` (Chỉ gọi bởi Consumer)**:
+  1. Đọc `tail` bằng `memory_order_relaxed`.
+  2. Đọc `head` bằng `memory_order_acquire` — ghép cặp đồng bộ (*synchronizes-with*) với `release` của Producer, đảm bảo đọc đúng nội dung `slots_[tail]`.
+  3. Nếu `tail == head` $\rightarrow$ vòng đệm rỗng, trả về `false`.
+  4. Di chuyển `out = std::move(slots_[tail])`.
+  5. Cập nhật `tail_.store(next_tail, std::memory_order_release)`.
+
+### 2.2 Hàng Đợi Đa Luồng Có Giới Hạn (`BoundedQueue<T>` — [`bounded_queue.h`](../../core/include/aegis/util/bounded_queue.h))
+Hỗ trợ 2 chính sách tràn hàng đợi rõ ràng:
+* `OverflowPolicy::kReject`: Từ chối phần tử mới khi đạt `capacity_`, buộc bên gửi xử lý áp lực ngược (Backpressure).
+* `OverflowPolicy::kDropOldest`: Loại bỏ phần tử cũ nhất ở đầu hàng đợi (`queue_.pop_front()`) và tăng bộ đếm `dropped_count_` để ưu tiên dữ liệu thời gian thực mới nhất.
+
+---
+
+## 3. Máy Trạng Thái Ghi Hình & Bộ Phân Xử Kích Hoạt (`recording/` & `trigger/`)
+
+### 3.1 Bộ Phân Xử Kích Hoạt (`TriggerArbiter` — [`trigger_arbiter.h`](../../core/include/aegis/trigger/trigger_arbiter.h))
+
+#### Bậc Ưu Tiên Nguồn Kích Hoạt (Priority Hierarchy)
 ```cpp
-{
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    if (write_queue_.size() >= 1000) {
-        write_queue_.pop(); // Drop oldest record to protect RAM
-    }
-    write_queue_.push(std::move(rec));
-}
+enum class TriggerSource {
+  kRemote  = 10,  // Lệnh từ trung tâm điều hành từ xa
+  kSignal  = 20,  // Tín hiệu BLE đồng bộ từ xe tuần tra / đồng đội xung quanh
+  kButton  = 30,  // Nút bấm vật lý trước ngực áo
+  kHolster = 40,  // Cảm biến rút vũ khí khỏi bao (Ưu tiên sinh tử cao nhất)
+};
 ```
 
-### 5.2 Ring Buffer Auto-Purge Policy (Disk Protection)
-When total rows in `detections` exceed $100,000$, delete oldest $10,000$ rows:
-```sql
-DELETE FROM detections WHERE id IN (
-    SELECT id FROM detections ORDER BY id ASC LIMIT 10000
-);
+#### Luật Chống Dội (`evaluate_trigger`) và Luật Chống Tắt Trái Phép (`evaluate_stop`)
+1. **Chống dội theo từng nguồn (`debounce_ms = 50 ms`)**:
+   * Mỗi nguồn $s$ có dấu thời gian kích hoạt gần nhất `last_trigger_ts_[s]`.
+   * Nếu `now_ms - last_trigger_ts_[s] < debounce_ms_` $\rightarrow$ trả về `ArbiterDecision::kDebounced` (bỏ qua xung nhiễu cơ khí).
+2. **Luật Nâng Cấp Nguồn Đang Hoạt Động**:
+   * Nếu đang ghi bởi nguồn $s_{\text{active}}$ (ví dụ `kSignal = 20`) và nhận lệnh `TRIGGER` từ nguồn $s_{\text{new}}$ có `trigger_priority(s_new) > trigger_priority(s_active)` (ví dụ `kHolster = 40`), `active_source_` được nâng cấp lên `kHolster`.
+3. **Luật Chặn Lệnh `STOP` Từ Nguồn Thấp Hơn**:
+   * Lệnh `STOP(s)` trong `evaluate_stop(s, now_ms)` chỉ trả về `kAccepted` khi và chỉ khi:
+     $$\text{trigger\_priority}(s) \ge \text{trigger\_priority}(s_{\text{active}})$$
+   * Ngược lại trả về `ArbiterDecision::kRejectedLowerPriority`. Nhờ đó, một gói tin `STOP remote` bị trễ trên mạng không bao giờ tắt được phiên ghi hình khi sĩ quan vừa rút súng (`kHolster`).
+
+### 3.2 Máy Trạng Thái Hướng Bảng (`RecordingStateMachine` — [`recording_state_machine.h`](../../core/include/aegis/recording/recording_state_machine.h))
+
+#### Sơ Đồ Chuyển Trạng Thái (State Diagram)
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Buffering : PowerOn / [kStartPreEventBuffer]
+    Buffering --> Recording : Trigger(src) / [kBeginIncident, kFlushPreEventBuffer]
+    Recording --> Recording : Tick (elapsed >= segment_duration_ms) / [kCutSegment]
+    Recording --> PostRecord : Stop(src) / [kEnterPostRecord]
+    PostRecord --> Recording : Trigger(src) (Re-trigger trong lúc PostRecord) / [kResumeRecording]
+    PostRecord --> PostRecord : Tick (seg_elapsed >= segment_duration_ms) / [kCutSegment]
+    PostRecord --> Buffering : Tick (post_elapsed >= post_record_ms) / [kCutSegment, kSealIncident]
+    Buffering --> Fault : StorageFull / [kRaiseFault]
+    Recording --> Fault : StorageFull / [kCutSegment, kSealIncident, kRaiseFault]
+    PostRecord --> Fault : StorageFull / [kCutSegment, kSealIncident, kRaiseFault]
+    Fault --> Buffering : FaultCleared / [kClearFault, kStartPreEventBuffer]
 ```
+
+#### Bảng Chuyển Trạng Thái Đầy Đủ (State Transition Matrix)
+| Trạng thái hiện tại | Sự kiện đầu vào (`Event`) | Điều kiện (Guard) | Trạng thái kế tiếp | Danh sách hành động phát ra (`Actions`) |
+|---|---|---|---|---|
+| `Idle` | `PowerOn` | — | `Buffering` | `[kStartPreEventBuffer]` |
+| `Buffering` | `Trigger(src)` | `evaluate_trigger == kAccepted` | `Recording` | `[kBeginIncident(src), kFlushPreEventBuffer]` |
+| `Recording` | `Tick(dt)` | `seg_elapsed + dt >= segment_duration_ms_` | `Recording` | `[kCutSegment]` |
+| `Recording` | `Stop(src)` | `evaluate_stop == kAccepted` | `PostRecord` | `[kEnterPostRecord]` (bắt đầu đếm `post_record_elapsed_ms_ = 0`) |
+| `PostRecord` | `Trigger(src)` | — | `Recording` | `[kResumeRecording(src)]` (hủy bộ đếm PostRecord, tiếp tục sự cố hiện tại) |
+| `PostRecord` | `Tick(dt)` | `post_elapsed + dt >= post_record_ms_` | `Buffering` | `[kCutSegment, kSealIncident]` |
+| `Recording` / `PostRecord` | `StorageFull` | — | `Fault` | `[kCutSegment, kSealIncident, kRaiseFault]` |
+| `Fault` | `FaultCleared` | — | `Buffering` | `[kClearFault, kStartPreEventBuffer]` |
 
 ---
 
-## 6. Hardware Watchdog ioctl Protocol (`IWatchdogHAL`)
+## 4. Thiết Kế Chi Tiết Tầng Bằng Chứng & Mật Mã Học (`evidence/` & `crypto/`)
 
+### 4.1 Cấu Trúc Khung Hình (`Frame`) và Xả Vòng Đệm Từ Keyframe (`PreEventBuffer`)
 ```cpp
-int fd = open("/dev/watchdog", O_WRONLY);
-int timeout = 60;
-ioctl(fd, WDIOC_SETTIMEOUT, &timeout);
+struct Frame {
+  uint64_t seq{0};                 // Số thứ tự khung hình tăng đơn điệu
+  uint64_t ts_ms{0};               // Dấu thời gian thu nhận (ms)
+  bool keyframe{false};            // true nếu là I-Frame (IDR) đọc độc lập
+  std::vector<uint8_t> payload;    // Dữ liệu H.264/H.265 NAL unit
+};
+```
+* **Thuật toán cắt cửa sổ trượt (`PreEventBuffer::push`)**:
+  * Khi thêm khung hình mới có dấu thời gian $t_{\text{now}}$, mọi khung hình ở đầu `std::deque<Frame>` có $t_{\text{now}} - t_{\text{frame}} > W_{\text{pre}}$ (mặc định $30.000\text{ ms}$) hoặc vượt quá `max_frames_` đều bị loại bỏ.
+* **Thuật toán căn chỉnh Keyframe (`PreEventBuffer::drain`)**:
+  * Một luồng video nén H.264/H.265 gồm các nhóm GOP (`I P P P ... I P P`). Nếu bắt đầu tệp phân đoạn bằng khung `P-frame`, trình phát video của tòa án sẽ bị vỡ hình cho đến kỳ `I-frame` tiếp theo.
+  * Do đó, `drain()` quét từ đầu vòng đệm để tìm chỉ số đầu tiên $k$ có `frames_[k].keyframe == true`, bỏ qua các khung `P-frame` mồ côi trước $k$, và di chuyển toàn bộ đoạn `frames_[k .. end]` sang danh sách khung hình của phân đoạn đầu tiên (`seg_000001.bin`).
 
-// In HealthService worker thread (every 30 seconds):
-ioctl(fd, WDIOC_KEEPALIVE, 0);
+### 4.2 Định Dạng Nhị Phân Của Tệp Phân Đoạn (`seg_%06u.bin` — [`segment_writer.cpp`](../../core/src/evidence/segment_writer.cpp))
+Mỗi tệp `seg_000001.bin` được tuần tự hóa theo định dạng nhị phân Little-Endian tự mô tả:
 
-// Graceful close: write magic character 'V' before close to prevent emergency board reboot
-write(fd, "V", 1);
-close(fd);
+```
++-----------------------------------------------------------------------+
+| Magic Header (4 bytes): "AEGS"                                        |
+| Frame Count  (4 bytes, uint32_t LE): N                                |
++-----------------------------------------------------------------------+
+| Frame 0 Header:                                                       |
+|   - seq          (8 bytes, uint64_t LE)                               |
+|   - ts_ms        (8 bytes, uint64_t LE)                               |
+|   - keyframe     (1 byte,  0x01 = I-Frame, 0x00 = P-Frame)            |
+|   - payload_size (4 bytes, uint32_t LE): L_0                          |
+| Frame 0 Payload  (L_0 bytes)                                          |
++-----------------------------------------------------------------------+
+| ... Frame 1 .. Frame N-1 ...                                          |
++-----------------------------------------------------------------------+
 ```
 
----
+### 4.3 Công Thức Toán Học Chuỗi Băm Nhị Phân & Chữ Ký HMAC (`manifest.json`)
 
-## 7. Bounded Queue Draining & Safe Shutdown Protocol
-
-During shutdown, all in-flight metadata must be cleanly committed without blocking or triggering watchdog reboots:
-
-1. **Stop Ingress**: `pipeline_->stop()` and `deepstream_hal_->stop()` disengage GStreamer elements and detach pad probes.
-2. **Drain EventBus**: `EventBus::dispatchLoop` uses a drain-to-empty loop:
+1. **Mã băm từng phân đoạn ($S_i$)**:
+   $$S_i = \text{SHA256}(\text{bytes}(\text{seg\_}i\text{.bin})) \in \{0,1\}^{256} \quad (32\text{ bytes nhị phân})$$
+2. **Chuỗi băm liên kết các phân đoạn ($H_i$ — [`hash_chain.cpp`](../../core/src/crypto/hash_chain.cpp))**:
+   * Khởi thủy (Genesis):
+     $$H_0 = 0^{32} \quad (32\text{ byte có giá trị } \text{0x00})$$
+   * Với mỗi phân đoạn thứ $i \in \{1, 2, \dots, n\}$:
+     $$H_i = \text{SHA256}(H_{i-1} \parallel S_i) \quad (\text{nối 32 byte nhị phân của } H_{i-1} \text{ và 32 byte nhị phân của } S_i)$$
+   * Đỉnh chuỗi băm của sự cố:
+     $$\text{chain\_head} = \text{hex}(H_n) \quad (64\text{ ký tự ASCII hex thường})$$
+3. **Chữ ký xác thực thiết bị (`hmac` — [`hmac.cpp`](../../core/src/crypto/hmac.cpp))**:
+   $$\text{hmac} = \text{hex}\Big(\text{HMAC-SHA256}\big(K_{\text{device}}, \text{ASCII}(\text{chain\_head})\big)\Big)$$
+   Trong đó $K_{\text{device}}$ được lấy từ [`IKeyStoreHal::get_device_hmac_key()`](../../core/include/aegis/hal/i_key_store_hal.h) (trong sản xuất thực tế nằm trong chip TPM 2.0 / ATECC608A; trong chế độ `--sim` là `"aegis-sim-device-key-DO-NOT-SHIP"`).
+4. **So sánh Thời gian Hằng số (Constant-Time Verification)**:
+   Để ngăn chặn tấn công đo thời gian phản hồi (Timing Side-Channel Attack) khi xác minh HMAC, hàm `HmacSha256::constant_time_hex_equals` tính tổng XOR trên toàn bộ chiều dài chuỗi:
    ```cpp
-   while (true) {
-       Event event;
-       {
-           std::unique_lock<std::mutex> lock(queue_mutex_);
-           queue_cv_.wait(lock, [this]() {
-               return !event_queue_.empty() || !running_;
-           });
-           if (!running_ && event_queue_.empty()) break;
-           event = std::move(event_queue_.front());
-           event_queue_.pop();
-       }
-       // Dispatch event to subscribers
+   uint8_t diff = 0;
+   for (size_t i = 0; i < a.size(); ++i) {
+     diff |= static_cast<uint8_t>(tolower(a[i]) ^ tolower(b[i]));
    }
+   return diff == 0;
    ```
-3. **Flush SQLite & Disconnect MQTT**: `StorageService::shutdown()` joins the background writer thread and invokes `flushQueue()` within a transaction before closing the SQLite database handle. `MqttService::disconnect()` sends MQTT DISCONNECT packet cleanly.
-4. **Safe Watchdog Release**: `HealthService::stop()` writes `'V'` to `/dev/watchdog` before closing the file descriptor, ensuring the board does not reboot during application termination.
+
+### 4.4 Công Thức Chuỗi Băm Nhật Ký Kiểm Toán (`audit.log` — [`audit_log.cpp`](../../core/src/evidence/audit_log.cpp))
+Mỗi bản ghi trong `<store_root>/audit.log` là 1 dòng văn bản gồm 6 trường phân cách bởi ký tự `|`:
+```
+<seq>|<ts_ms>|<event>|<detail>|<prev_hash_hex>|<hash_hex>
+```
+* Với bản ghi đầu tiên ($\text{seq} = 1$): $\text{prev\_hash\_hex} = \text{"0000...0000"}$ (64 ký tự `'0'`).
+* Công thức băm dòng thứ $k$:
+  $$\text{hash\_hex}_k = \text{hex}\Big(\text{SHA256}\big(\text{prev\_hash\_hex}_k \parallel \text{"|"} \parallel \text{seq}_k \parallel \text{"|"} \parallel \text{ts\_ms}_k \parallel \text{"|"} \parallel \text{event}_k \parallel \text{"|"} \parallel \text{detail}_k\big)\Big)$$
+* Nếu kẻ tấn công xóa dòng thứ $k$ hoặc sửa bất kỳ ký tự nào trong dòng $k$, phép kiểm tra tại dòng $k$ hoặc liên kết `prev_hash_hex` tại dòng $k+1$ sẽ lập tức báo lỗi `INTEGRITY_ERROR`.
+
+### 4.5 Giao Thức Ghi Nguyên Tử Chống Mất Điện (`PosixStorageHal::write_file_atomic` — [`posix_storage_hal.cpp`](../../core/hal/linux/posix_storage_hal.cpp))
+Khi pin bị giật ra giữa chừng, hệ thống tệp `ext4`/`f2fs` có thể đã cập nhật metadata nhưng dữ liệu trong page cache chưa xuống chip nhớ eMMC, hoặc tệp mới chỉ ghi được một nửa. `write_file_atomic(rel_path, data, len)` thực hiện đúng 5 bước POSIX:
+1. Mở tệp tạm `<rel_path>.tmp` với cờ `O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC`.
+2. Ghi toàn bộ `data` qua vòng lặp `::write()` (xử lý `EINTR` và partial write).
+3. Gọi `::fsync(tmp_fd)` để ép toàn bộ page cache của tệp `.tmp` xuống bề mặt chip nhớ flash, sau đó `::close(tmp_fd)`.
+4. Gọi `::rename(tmp_path, final_path)` — thao tác nguyên tử ở tầng inode của nhân Linux: tệp đích hoặc là phiên bản cũ hoàn chỉnh, hoặc là phiên bản mới hoàn chỉnh.
+5. Mở thư mục cha (`O_RDONLY | O_DIRECTORY`) và gọi `::fsync(dir_fd)` để đảm bảo mục thư mục (directory entry) sau khi `rename` cũng được ghi bền vững xuống flash.
+
+Khi khởi động lại sau sự cố sập nguồn, `EvidenceStore::recover()` quét toàn bộ `incidents/*`:
+* Xóa mọi tệp `.tmp` mồ côi đang ghi dở.
+* Đọc `manifest.json`, kiểm tra lại từng tệp `seg_*.bin` đã liệt kê và xóa các tệp `seg_*.bin` chưa kịp ghi vào `manifest.json`, đảm bảo sự cố luôn dừng ở trạng thái nhất quán mật mã học.
 
 ---
 
-## 8. Application Entry Point & Signal Handling Specification (`main.cpp`)
+## 5. Thiết Kế Chi Tiết Các Thuật Toán Trong Go `netagent` (`netagent/internal/`)
 
-The executable binary (`edge-ai-manager`) entry point is implemented in `src/app/main.cpp`:
+### 5.1 Bộ Chọn Đường Truyền Có Trễ Chống Dao Động (`internal/link/link.go`)
+Khi xe tuần tra rời trạm (mất Wi-Fi, chuyển sang LTE) rồi đi ngang qua vùng phủ Wi-Fi yếu chập chờn, nếu chuyển về Wi-Fi ngay ở gói ping thành công đầu tiên sẽ gây rớt kết nối liên tục (**Link Flapping**). [`link.Manager`](../../netagent/internal/link/link.go) giải quyết bằng:
+* **Điểm sức khỏe (`Score` $\in [0, 100]$)**:
+  * Khởi điểm `s = 100` nếu đường truyền đang `healthy == true`, hoặc `min(50, 10 * okStreak)` nếu đang `healthy == false`.
+  * Trừ `25 * failStreak` cho mỗi lần thăm dò thất bại liên tiếp, và trừ thêm `20` điểm nếu `lastRTT > SlowRTT` (mặc định `300 ms`), giới hạn trong đoạn $[0, 100]$.
+* **Bộ đếm Hysteresis**:
+  * Một đường truyền đang `healthy = false` phải thăm dò thành công liên tiếp **`RiseThreshold = 3` lần** (`okStreak >= RiseThreshold`) mới chuyển sang `healthy = true`.
+  * Một đường truyền đang `healthy = true` phải bị lỗi liên tiếp **`FallThreshold = 2` lần** (`failStreak >= FallThreshold`) mới bị đánh dấu `healthy = false`.
+* **Chính sách Đường truyền Tính cước (`AllowUpload(p Priority)`)**:
+  * Nếu đang đi qua `Ethernet` hoặc `WiFi` (`Metered = false`): cho phép tải lên mọi phân đoạn (`AllowUpload = true`).
+  * Nếu đang đi qua `LTE` (`Metered = true`): chỉ cho phép tải lên khi `p >= PriorityHigh` (ví dụ kích hoạt từ `holster` hoặc `signal`), giữ các sự cố thường (`PriorityNormal`) trong flash đợi về trạm Wi-Fi/Dock.
 
-```cpp
-int main(int argc, char* argv[]) {
-    std::string config_path = "config/app_config.yaml";
-    bool use_mock_hal = false;
+### 5.2 Máy Trạng Thái Thuê Bao DHCP Chuẩn RFC 2131 (`internal/dhcp/dhcp.go`)
+Từ thời điểm bắt đầu thuê bao `Obtained` với thời hạn `LeaseTime`:
+* $T_1 = \text{Obtained} + 0.50 \times \text{LeaseTime}$ (**Mốc Renew — 50%**): chuyển từ `BOUND` sang `RENEWING` (gửi `DHCPREQUEST` unicast tới máy chủ DHCP hiện tại).
+* $T_2 = \text{Obtained} + 0.875 \times \text{LeaseTime}$ (**Mốc Rebind — 87.5%**): chuyển từ `RENEWING` sang `REBINDING` (gửi `DHCPREQUEST` broadcast tìm bất kỳ máy chủ DHCP nào).
+* $T_{\text{exp}} = \text{Obtained} + \text{LeaseTime}$ (**Mốc Expiry — 100%**): chuyển về `INIT` (thu hồi IP và khởi tạo lại quy trình DORA).
 
-    // 1. Argument parsing
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if ((arg == "--config" || arg == "-c") && i + 1 < argc) {
-            config_path = argv[++i];
-        } else if (arg == "--mock" || arg == "-m") {
-            use_mock_hal = true;
-        } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: edge-ai-manager [options]\n"
-                      << "Options:\n"
-                      << "  -c, --config <file>  Path to YAML configuration file (default: config/app_config.yaml)\n"
-                      << "  -m, --mock           Run in host PC mock mode (without Jetson GPU/CSI camera)\n"
-                      << "  -h, --help           Show this help message\n"
-                      << "  -v, --version        Print version info\n";
-            return 0;
-        } else if (arg == "--version" || arg == "-v") {
-            std::cout << "edge-ai-manager v1.0.0 (Jetson Nano / Yocto Linux / C++17)\n";
-            return 0;
-        }
-    }
+### 5.3 Phát Hiện Captive Portal & DNS Hijacking (`internal/dnscheck/dnscheck.go`)
+Nhiều mạng Wi-Fi công cộng cấp IP và trả lời DNS bình thường nhưng chuyển hướng mọi tên miền về trang đăng nhập cục bộ (ví dụ `192.168.1.1`). `Checker.CheckCanary(ctx)` phân giải tên miền kiểm chứng `CanaryHost` (bỏ qua cache) và đối chiếu mọi địa chỉ IP trả về với danh sách tiền tố CIDR kỳ vọng `ExpectedCanary` (ví dụ `10.99.0.0/16` của mạng nội bộ VPN). Nếu bất kỳ IP nào trả về không nằm trong `ExpectedCanary`, `CheckCanary` trả về lỗi `ErrHijackDetected` để `netagent` không coi mạng Wi-Fi đó là sẵn sàng.
 
-    // 2. Install POSIX signal handlers
-    std::signal(SIGINT,  edge_ai::EdgeAIManager::signalHandler);
-    std::signal(SIGTERM, edge_ai::EdgeAIManager::signalHandler);
+### 5.4 Giám Sát Hầm WireGuard VPN & Công Tắc Ngắt (`internal/vpn/vpn.go`)
+* Giao thức WireGuard hoạt động hướng trạng thái im lặng nhưng luân chuyển khóa mỗi 2–3 phút. `Supervisor.Check(ctx)` kiểm tra tuổi của lần bắt tay gần nhất:
+  $$\text{HandshakeFresh} \iff \neg\text{LastHandshake.IsZero()} \land (\text{now} - \text{LastHandshake} \le \text{MaxHandshakeAge (3m)})$$
+* **Công tắc ngắt (`AllowTraffic()`)**:
+  ```go
+  func (s *Supervisor) AllowTraffic() bool {
+      s.mu.Lock()
+      defer s.mu.Unlock()
+      if !s.cfg.KillSwitch {
+          return true
+      }
+      return s.healthy
+  }
+  ```
+  Khi `KillSwitch = true` (mặc định trên thiết bị thực thi pháp luật), không một byte bằng chứng nào được phép rời khỏi `uploader` nếu hầm WireGuard chưa bắt tay thành công.
 
-    // 3. Application instantiation & RAII lifecycle
-    edge_ai::EdgeAIManager app;
-
-    if (!app.initialize(config_path, use_mock_hal)) {
-        std::cerr << "[Fatal Error] EdgeAIManager failed to initialize.\n";
-        return 1;
-    }
-
-    app.run();
-    app.shutdown();
-
-    return 0;
-}
-```
-
-### 8.1 Async-Signal-Safe Signal Handler (`EdgeAIManager::signalHandler`)
-POSIX signal handling inside multi-threaded C++ applications requires strict avoidance of non-reentrant functions (e.g. `malloc`, `printf`, `mutex::lock`):
-```cpp
-// Static member variable in EdgeAIManager
-std::atomic<bool> EdgeAIManager::stop_requested{false};
-
-void EdgeAIManager::signalHandler(int signum) {
-    (void)signum;
-    stop_requested = true; // Lock-free atomic store, guaranteed async-signal-safe
-}
-```
-
-### 8.2 Main Thread Processing Loop (`EdgeAIManager::run`)
-```cpp
-void EdgeAIManager::run() {
-    if (!initialized_) return;
-
-    LogService::info("Entering multi-camera detection loop...");
-
-    while (!stop_requested) {
-        if (!pipeline_->isDeepStream()) {
-            // Modular fallback single-camera mode (CPU / OpenCV)
-            PipelineResult result;
-            if (pipeline_->processOneFrame(result)) {
-                onPipelineResult(result);
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            }
-        } else {
-            // DeepStream mode: Ingestion, batching, inference, and pad probe
-            // execute fully asynchronously on GStreamer/CUDA hardware threads.
-            // Main thread sleeps to yield CPU cycles (< 0.1% CPU load).
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-
-    LogService::info("Stop requested, exiting multi-camera detection loop...");
-}
-```
-
-### 8.3 Return Codes & Failure Modes
-
-| Exit Code | Condition | Cause | Mitigations |
-|:---:|---|---|---|
-| **`0`** | Clean Exit | User triggered `Ctrl+C` (`SIGINT`) or systemd stopped service (`SIGTERM`) | Normal lifecycle termination |
-| **`0`** | CLI Inquiry | Executed with `--help` or `--version` | Informational CLI flags |
-| **`1`** | Fatal Init Error | Configuration file not found or corrupted YAML syntax | Check `-c <path>` or verify YAML syntax with `yamllint` |
-| **`1`** | Hardware HAL Error | CSI sensor not detected or DeepStream pipeline failed to initialize | Check camera cables (`dmesg \| grep imx219`) or restart `nvargus-daemon` |
-
+### 5.5 Thuật Toán Tải Lên Phân Mảnh Có Thể Nối Lại & Token Bucket (`internal/uploader/uploader.go`)
+1. **Khám phá vị trí nối lại (Resume Offset Discovery)**:
+   * Gửi `HEAD /v1/incidents/<incident_id>/segments/<index>`.
+   * Đọc header phản hồi `Upload-Offset: <bytes>`. Nếu máy chủ đã có 4 MiB đầu tiên từ trước khi xe đi vào hầm mất sóng, `Uploader` nhảy thẳng tới byte thứ `4.194.304` mà không tải lại từ đầu.
+2. **Đẩy từng mảnh 4 MiB kèm mã băm (`PATCH`)**:
+   * Đọc mảnh $[ \text{offset}, \text{offset} + 4\text{ MiB} )$, tính `sha256` của riêng mảnh đó, gắn vào header `X-Chunk-SHA256`, `Upload-Offset`, `Upload-Length`.
+3. **Full-Jitter Exponential Backoff**:
+   * Khi gặp lỗi mạng hoặc HTTP `5xx`/`429`, thời gian chờ ở lần thử lại thứ $a \ge 1$ được tính bằng công thức Full-Jitter của AWS để tránh hiện tượng hàng nghìn camera cùng kết nối lại một lúc (Thundering Herd) khi trạm thu phát sóng vừa phục hồi:
+     $$\text{ceil}_a = \min\big(\text{MaxBackoff}, \text{BaseBackoff} \times 2^{a-1}\big), \quad \text{sleep}_a = \text{Uniform}\big(0, \text{ceil}_a\big)$$
+4. **Giới hạn băng thông bằng Token Bucket**:
+   * Mỗi lần chuẩn bị đẩy mảnh $B$ byte, `tokenBucket.Wait(ctx, B)` điều tiết tốc độ theo ngưỡng `BandwidthBps` (`waitDur = B / rate`), đảm bảo việc tải video không làm nghẽn đường truyền đàm thoại/tín hiệu khẩn cấp.
 

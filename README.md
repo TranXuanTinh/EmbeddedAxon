@@ -1,166 +1,117 @@
-# Multi-Camera Video Analytics Framework (NVIDIA DeepStream & Yocto Linux)
+# AegisCam — Mission-Critical Embedded Evidence Camera Platform
 
-Production-grade real-time Multi-Camera Video Analytics, Object Detection, Tracking, and Spatial Rule Evaluation framework engineered for NVIDIA Jetson platforms (Jetson Nano, Xavier NX, Orin Nano) using the **NVIDIA DeepStream SDK**, **Yocto Linux**, and **C++17**.
-
----
-
-## 🌟 Key Features
-
-* **Multi-Source Video Ingestion**:
-  * Simultaneous capture from Dual MIPI CSI-2 sensors (`nvarguscamerasrc` via ISP).
-  * High-throughput network IP camera ingestion (RTSP H.264/H.265 via hardware `nvv4l2decoder`).
-  * Synthetic video files and test pattern feeds for offline benchmarking.
-* **Hardware-Accelerated DeepStream Pipeline**:
-  * **Zero-Copy Memory**: All frames reside in unified NVMM (NVidia Memory Management) buffers from capture through decoding, scaling, and inference.
-  * **Dynamic Multi-Stream Batching**: `nvstreammux` collects $N$ asynchronous camera streams into synchronized GPU inference batches.
-  * **Batched Primary GIE**: TensorRT-accelerated YOLOv8 (`nvinfer`) operating in FP16 / INT8 modes.
-  * **Multi-Stream Object Tracking**: Hardware `nvtracker` maintaining persistent tracking IDs per camera channel without inter-channel ID collisions.
-  * **Pad Probe Metadata Extraction**: High-performance, zero-overhead metadata extraction (`GST_PAD_PROBE_TYPE_BUFFER`) inspecting `NvDsBatchMeta` without copying frame pixel memory.
-* **Per-Camera Spatial Rule Engine**:
-  * Multi-channel zone intrusion detection (ray-casting point-in-polygon algorithm) bound to specific camera IDs (`cam_01`, `cam_02`) or wildcard (`*`).
-  * Directional line-crossing counting with compound keying `[camera_id, track_id]` preventing cross-camera ID collision.
-  * Per-camera alert cooldown and automated state purge (`resetCameraState`) upon camera reconnect.
-* **Dual-Mode Architectural Execution**:
-  * **Target Jetson Mode (`ENABLE_DEEPSTREAM=ON`)**: Full NVIDIA hardware acceleration via DeepStream SDK GStreamer plugins.
-  * **Host Simulation Mode (`MockDeepStreamHAL`)**: 100% functional host simulation running on standard x86 Linux / Windows without Jetson hardware or DeepStream SDK, enabling comprehensive CI/CD testing.
-* **Industrial Embedded Foundation & Verified Safety**:
-  * Multi-topic Paho MQTT client publishing structured telemetry (`edge/<device>/<camera_id>/detections`) and per-camera runtime telemetry (`CameraRuntimeMetrics`).
-  * Embedded SQLite3 database with multi-camera indexing (`camera_id`, `source_id`) and bounded memory ring-buffer queue (1,000 records).
-  * Deterministic 4-phase safe shutdown order (Ingress $\to$ Queue Drain $\to$ DB/MQTT $\to$ Watchdog release `'V'`).
-  * Tegra hardware watchdog integration and dynamic thermal PWM fan control.
-  * Dedicated Yocto Project BSP layer (`meta-jetson-ai-detect`).
-
+**AegisCam** is a reference software platform for a mission-critical **body-worn / in-vehicle evidence camera**, engineered to demonstrate Staff / Lead Embedded Software Engineer practices across real-time Linux C++17, cryptographic chain-of-custody, resilient networking (Go), A/B OTA updates, hardware watchdog supervision, Yocto/systemd integration, and governed AI-assisted development.
 
 ---
 
-## 📁 Repository Structure
+## Architecture Overview
 
-```
-├── docs/
-│   ├── system_requirements/     # Hardware specs, multi-CSI, RTSP bandwidth, power & thermal
-│   ├── software_requirements/   # Yocto Dunfell, DeepStream SDK 6.0+, GStreamer plugins
-│   ├── SETUP_GUIDE.md           # Step-by-step setup guide (Host PC, Jetson Native, Yocto)
-│   └── design/
-│       ├── system_design.md     # 3-Tier architecture, NVMM zero-copy flow, RAM budget
-│       ├── software_design.md   # IDeepStreamHAL interface, DI, and class hierarchy
-│       ├── high_level_design.md # Subsystem contracts and DeepStream pad probe flow
-│       ├── low_level_design.md  # NvDsBatchMeta mapping, Ray-casting math, SQLite schema
-│       ├── threading_model.md   # Concurrency architecture: DeepStream threads & GStreamer bus
-│       └── system_workflow.md   # Per-batch CPU/GPU/VIC/NVDEC lifecycle and timing budget
-│
-├── config/
-│   ├── app_config.yaml          # Multi-camera sources, DeepStream engine, MQTT, storage
-│   ├── rules.yaml               # Per-camera zone polygon & line crossing rules
-│   ├── deepstream_pgie_config.txt    # Primary GIE (YOLOv8) nvinfer configuration
-│   └── deepstream_tracker_config.txt # nvtracker multi-stream configuration
-│
-├── include/
-│   ├── app/                     # Tier 1: types.h, edge_ai_manager.h, pipeline.h, rule_engine.h
-│   │   └── rules/               # i_rule.h, zone_rule.h, counting_rule.h
-│   ├── service/                 # Tier 2: camera, inference, tracker, pre/postprocessor,
-│   │                            #         kalman/hungarian, event_bus, mqtt, storage, health, config, log
-│   └── hal/                     # Tier 3: i_deepstream_hal, i_camera_hal, i_gpu_hal,
-│                                #         i_network_hal, i_storage_hal, i_sensor_hal, i_watchdog_hal
-│
-├── src/
-│   ├── app/                     # Tier 1 implementation & main.cpp entry point
-│   ├── service/                 # Tier 2 platform-independent services
-│   └── hal/
-│       ├── jetson/              # Tier 3 Jetson HALs (DeepStream, GStreamer, CUDA, SQLite, sysfs)
-│       └── mock/                # Tier 3 Mock HALs for 100% Host PC testing without hardware
-│
-├── tests/                       # Unit tests for Multi-Camera Pipeline and Per-Camera RuleEngine
-├── yocto/meta-jetson-ai-detect/ # Custom Yocto layer (recipes for app and system image)
-├── systemd/                     # Production systemd daemon unit file with hardware watchdog
-└── CMakeLists.txt               # Unified CMake build definition with ENABLE_DEEPSTREAM option
+AegisCam splits device responsibilities across two cooperating daemons with strict fault and privilege boundaries:
+
+1. **`aegisd` (`core/`, C++17)** — Real-time capture, lock-free SPSC ring buffer, keyframe-aligned pre-event circular buffer, deterministic table-driven recording state machine, debounced priority trigger arbiter, power-loss safe segment writer (`tmp` + `fsync` + atomic `rename`), SHA-256 hash chain + HMAC-SHA256 signed `manifest.json`, append-only hash-chained `audit.log`, A/B OTA slot manager with boot-counter rollback, and per-thread deadline watchdog supervisor.
+2. **`netagent` (`netagent/`, Go 1.22)** — Multi-interface link manager (`eth > wifi > lte`) with failback hysteresis and metered-link policy, DNS health + captive-portal/hijack detection, DHCP lease state machine (`BOUND → RENEWING → REBINDING → INIT`), WireGuard VPN config renderer + handshake supervisor with kill-switch, and resumable chunked evidence uploader with per-chunk SHA-256, token-bucket bandwidth cap, and full-jitter exponential backoff.
+
+Every hardware dependency in `aegisd` sits behind a pure C++ interface (`ICameraHal`, `IStorageHal`, `IWatchdogHal`, `IKeyStoreHal`, `IBootControlHal`, `IClock`), enabling 100% deterministic host simulation (`aegisd --sim`) driven by virtual time (`TICK <ms>`).
+
+---
+
+## Repository Layout
+
+```text
+aegiscam/
+├── CMakeLists.txt                  # Top-level C++17 build (aegis_core, HALs, aegisd, tests, fuzz)
+├── CMakePresets.json               # Presets: dev, asan-ubsan, tsan, coverage, release-aarch64
+├── cmake/toolchain-aarch64.cmake   # ARM64 Linux cross-compilation toolchain
+├── .clang-format / .clang-tidy     # Strict formatting & static analysis rules
+├── core/                           # C++17 device daemon "aegisd"
+│   ├── include/aegis/<module>/     # Public headers (common, util, crypto, hal, evidence, ...)
+│   ├── src/<module>/               # Core module implementations
+│   ├── hal/sim/                    # Deterministic simulation HALs (FakeClock, fault injection)
+│   ├── hal/linux/                  # Embedded Linux HALs (/dev/watchdog, POSIX fsync, V4L2)
+│   ├── apps/aegisd_main.cpp        # aegisd CLI & line-protocol server
+│   ├── tests/unit/                 # GoogleTest unit test suite
+│   ├── tests/integration/          # End-to-end DeviceController integration tests
+│   └── fuzz/                       # libFuzzer target for IPC command parser
+├── netagent/                       # Go 1.22 connectivity, VPN & resumable upload agent
+├── tests/system/                   # Pytest black-box system tests driving `aegisd --sim`
+├── tools/verify_evidence.py        # Offline chain-of-custody & audit log verifier (Python stdlib)
+├── deploy/systemd/                 # Hardened systemd unit files (aegisd.service, aegis-netagent.service)
+├── deploy/yocto/meta-aegiscam/     # Yocto layer recipes for aegisd, netagent, and read-only rootfs image
+└── docs/                           # Architecture, ADRs, engineering process, AI governance
 ```
 
 ---
 
-## 🚀 Quickstart
+## Quick Start: Build & Test
 
-### 1. Host PC Testing (No Jetson Hardware or DeepStream SDK Needed)
+> 📖 **Xem hướng dẫn cài đặt, biên dịch & vận hành chi tiết tại: [SETUP.md (How to Set Up)](./SETUP.md)**
 
-Run the entire multi-camera application and automated test suite on your standard x86 Linux or Windows development machine:
+### 1. C++17 Core (`aegisd` & GoogleTest suite)
 
 ```bash
-mkdir -p build && cd build
-cmake .. -DBUILD_TESTS=ON
-cmake --build . -j$(nproc)
+# Configure and build (dev preset)
+cmake --preset dev
+cmake --build --preset dev
 
-# Run automated tests:
-ctest --output-on-failure
+# Run unit + integration tests
+ctest --preset dev
 
-# Launch multi-camera simulator:
-./edge-ai-manager --config ../config/app_config.yaml --mock
+# Run with AddressSanitizer + UndefinedBehaviorSanitizer
+cmake --preset asan-ubsan
+cmake --build --preset asan-ubsan
+ctest --preset asan-ubsan
+
+# Cross-compile for ARM64 Embedded Linux (aarch64-linux-gnu)
+cmake --preset release-aarch64
+cmake --build --preset release-aarch64
 ```
 
-### 2. Native Execution on NVIDIA Jetson
-
-When building on an NVIDIA Jetson board equipped with DeepStream SDK:
+### 2. Go Connectivity & Upload Agent (`netagent`)
 
 ```bash
-mkdir -p build && cd build
-cmake .. \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_DEEPSTREAM=ON \
-    -DENABLE_PAHO_MQTT=ON \
-    -DENABLE_SQLITE3=ON \
-    -DENABLE_YAML_CPP=ON
-
-cmake --build . -j4
-sudo ./edge-ai-manager --config ../config/app_config.yaml
+cd netagent
+go test -race ./...
+go build ./cmd/netagent
 ```
 
-### 3. Yocto Project Embedded OS Build
+### 3. End-to-End System Tests & Chain-of-Custody Verifier
 
-To generate a production-ready, stripped-down Linux operating system:
+```bash
+# Run black-box pytest suite against aegisd --sim
+pytest tests/system
 
-1. Clone Poky Dunfell and dependencies:
-   ```bash
-   git clone -b dunfell git://git.yoctoproject.org/poky
-   git clone -b dunfell-l4t-r32.7.x https://github.com/OE4T/meta-tegra.git
-   git clone -b dunfell https://github.com/openembedded/meta-openembedded.git
-   ```
-2. Integrate `meta-jetson-ai-detect` into `conf/bblayers.conf`.
-3. Set `MACHINE = "jetson-nano"` (or `jetson-orin-nano`) in `conf/local.conf`.
-4. Compile the final image:
-   ```bash
-   bitbake jetson-ai-image
-   ```
-5. Flash the generated `.sdcard` image to your target MicroSD card or eMMC storage.
-
----
-
-## 📊 Pipeline Dataflow
-
-```
-[Cam 0: CSI ] -> nvarguscamerasrc -\
-                                    +-> nvstreammux -> nvinfer (PGIE) -> nvtracker -> [Pad Probe] -> fakesink
-[Cam 1: RTSP] -> rtspsrc -> nvdec -/    (Batch N)    (Batched TensorRT)  (Multi-ID)        |
-                                                                                           v
-                                                                                   PipelineResult
-                                                                                           |
-                                                                             +-------------+-------------+
-                                                                             |                           |
-                                                                             v                           v
-                                                                     RuleEngine (cam_id)         StorageService
-                                                                             |                   (Indexed SQLite)
-                                                                             v
-                                                                        MqttService
-                                                                    (edge/.../alerts)
+# Verify an evidence store directory offline
+python3 tools/verify_evidence.py /path/to/store_root
 ```
 
 ---
 
-## 📜 Documentation Index
+## Alignment with Staff / Lead Embedded Software Engineer Requirements
 
-* [System Design](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/design/system_design.md)
-* [High-Level Design](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/design/high_level_design.md)
-* [Software Design](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/design/software_design.md)
-* [Low-Level Design](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/design/low_level_design.md)
-* [Threading Model](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/design/threading_model.md)
-* [System Workflow](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/design/system_workflow.md)
-* [Hardware Setup & Deployment Guide](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/SETUP_GUIDE.md)
-* [System Requirements](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/system_requirements/README.md)
-* [Software Requirements](file:///media/tinhtran/01D85BC599D1D460/FreeLancer/MultiCamera/docs/software_requirements/README.md)
+| Area | Implementation in AegisCam |
+|------|----------------------------|
+| **Embedded Linux & C++17** | `SCHED_FIFO` real-time capture/supervisor design, lock-free `SpscRingBuffer`, bounded MPMC queues, zero heap/lock on capture path, V4L2 / `/dev/watchdog` / POSIX `fsync` HALs, Yocto layer & hardened `systemd` units |
+| **Security & Chain of Custody** | FIPS 180-4 SHA-256, RFC 2104 HMAC-SHA256, cryptographic segment hash chain ($H_n = \text{SHA256}(H_{n-1} \parallel h_n)$), tamper-evident `audit.log`, offline `verify_evidence.py` |
+| **Low Latency & Power-Loss Safety** | Keyframe-aligned pre-event buffer, < 100 ms trigger-to-record state machine, atomic `tmp` + `fsync` + `rename` segment & manifest writes |
+| **Resilient Networking** | Go `netagent` with `eth > wifi > lte` hysteresis failover, DNS hijack/captive-portal detection, DHCP state machine, WireGuard supervisor + kill-switch, resumable chunked uploads |
+| **OTA & 24/7 Reliability** | A/B slot manager with SHA-256 verification and 3-boot-attempt automatic rollback; per-thread heartbeat deadline supervisor gating hardware watchdog kicks |
+| **Testing & AI Governance** | Deterministic `--sim` mode with `FakeClock`, unit/integration/system/fuzz tests, ASan/UBSan/TSan presets, and documented AI-assisted development quality gates (`docs/ai_assisted_development/`) |
+
+---
+
+## 📜 Design & Architecture Documentation Index
+
+### Detailed System Design (`docs/design/`)
+* [System Design (SDD)](docs/design/system_design.md) — 3-Layer & Dual-Process (`aegisd` + `netagent`) architecture, end-to-end data flow, RAM & eMMC flash A/B partition budget, and fault-tolerance matrix.
+* [Software Design (SWDD)](docs/design/software_design.md) — Package decomposition, HAL interface contracts (`ICameraHal`, `IStorageHal`, `IWatchdogHal`, `IKeyStoreHal`, `IBootControlHal`), Dependency Injection wiring, IPC line protocol, and 4-tier testing architecture.
+* [High-Level Design (HLD)](docs/design/high_level_design.md) — Module responsibilities inventory, subsystem interaction diagram, DI class diagram, sequence diagrams, and requirements traceability matrix (R1–R8).
+* [Low-Level Design (LLD)](docs/design/low_level_design.md) — C++17 data structures, lock-free `SpscRingBuffer` memory layout & acquire/release ordering, table-driven FSM transition matrix, cryptographic chain-of-custody formulas, atomic filesystem writes, and Go `netagent` algorithms.
+* [Process, Threading & Real-Time Resource Model](docs/design/threading_and_process_model.md) — Why `aegisd` (C++17) and `netagent` (Go 1.22) run as isolated OS processes, SoC ARM64 CPU affinity map, thread & goroutine inventory (`SCHED_FIFO` vs `SCHED_OTHER`), priority inversion avoidance, `WatchdogSupervisor`, and 4-phase graceful shutdown.
+* [End-to-End System Workflow Specification](docs/design/system_workflow.md) — Complete 12-step walkthrough of a full program lifecycle from boot to power-off with function-level code trace, data transformations, and millisecond timing budget.
+
+### Architecture, ADRs, Process & AI Governance (`docs/`)
+* **Architecture Specs**: [PROJECT_SPEC.md](docs/architecture/PROJECT_SPEC.md), [System Overview](docs/architecture/system_overview.md), [Threading & Real-Time](docs/architecture/threading_and_realtime.md), [Security Model](docs/architecture/security_model.md), [Networking](docs/architecture/networking.md)
+* **Architecture Decision Records (ADRs)**: [ADR Index](docs/adr/README.md) (`0001` HAL & DI, `0002` Lock-Free Pre-Event Buffer, `0003` Segment Evidence & Hash Chain, `0004` A/B OTA Rollback, `0005` Go for Connectivity Agent, `0006` WireGuard over IPsec/OpenVPN)
+* **Engineering Process & Leadership**: [Design Review Template](docs/process/design_review_template.md), [Code Review Guidelines](docs/process/code_review_guidelines.md), [Operational Readiness](docs/process/operational_readiness.md), [Tech Roadmap](docs/process/tech_roadmap.md), [Mentoring Framework](docs/process/mentoring_framework.md)
+* **AI-Assisted Development Governance**: [AI Policy](docs/ai_assisted_development/policy.md), [Quality Gates](docs/ai_assisted_development/quality_gates.md), [Prompt Library](docs/ai_assisted_development/prompt_library.md), [Review Checklist](docs/ai_assisted_development/review_checklist.md), [Metrics](docs/ai_assisted_development/metrics.md)
+

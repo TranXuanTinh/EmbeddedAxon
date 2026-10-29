@@ -1,214 +1,388 @@
-# High-Level Design Document (HLD)
-## Project: Multi-Camera Edge AI Video Analytics on Jetson with NVIDIA DeepStream SDK
+# High-Level Design Document (HLD) — AegisCam Platform
+## Mission-Critical Body-Worn & In-Vehicle Evidence Camera System (`aegisd` C++17 + `netagent` Go 1.22)
+
+Tài liệu **High-Level Design (HLD)** này mô tả kiến trúc tổng thể cấp hệ thống của dự án **AegisCam**, bao gồm sự phân tách đa tiến trình (Multi-Process Isolation), phân tầng kiến trúc 3 lớp (3-Tier Architecture), bảng trách nhiệm từng module, sơ đồ tương tác giữa các phân hệ, sơ đồ lớp Dependency Injection (DI), và các biểu đồ tuần tự (Sequence Diagrams) cho các luồng nghiệp vụ cốt lõi.
 
 ---
 
-## 1. Module Overview & Responsibilities
+## 1. Triết Lý Kiến Trúc Tổng Thể (Architectural Principles)
 
-The system is decomposed into 3 distinct architectural tiers (Application, Service, and Hardware Abstraction Layer):
+Thiết bị camera bằng chứng chuyên dụng (Body-Worn / Patrol Vehicle Camera) hoạt động trong môi trường khắc nghiệt: rung chấn, mất mạng liên tục, có thể bị rút pin bất kỳ lúc nào, và mọi tệp video xuất ra phải có **giá trị pháp lý trước tòa án (Chain of Custody)**. Do đó, kiến trúc của AegisCam được xây dựng dựa trên 5 nguyên tắc cốt lõi:
 
-| Module | Tier | Responsibility | Primary Interactions |
-|---|---|---|---|
-| **main.cpp** | App | Process bootstrapper, CLI argument parser (`--config`, `--mock`), POSIX signal trap (`SIGINT`, `SIGTERM`), and exit code controller | Instantiates `EdgeAIManager`; coordinates startup, main loop, and graceful exit |
-| **EdgeAIManager** | App | System lifecycle, dependency injection, service instantiation, and graceful shutdown | Owns all Service and HAL instances; routes DeepStream metadata callbacks |
-| **Pipeline** | App | Coordinates video analytics pipeline execution, supporting both DeepStream hardware mode and modular service mode | Interfaces with `IDeepStreamHAL` or `CameraService` + `InferenceService` + `TrackerService` |
-| **RuleEngine** | App | Evaluates spatial business rules (`ZoneRule`, `CountingRule`) with per-camera channel isolation, compound keying `[camera_id, track_id]`, and camera state resets on reconnect | Receives tracked objects tagged with `camera_id`; publishes alerts to `EventBus` |
-| **CameraService** | Service | Manages camera capture lifecycle, frame buffer retrieval, reconnect logic, and resolution setting | Wraps `ICameraHAL`; delivers frames in modular/fallback mode |
-| **InferenceService** | Service | Coordinates deep learning model inference, input scaling, GPU execution, and tensor parsing | Wraps `IGpuHAL`, `Preprocessor`, and `Postprocessor` |
-| **TrackerService** | Service | Multi-object tracking (ByteTrack algorithm) maintaining persistent object trajectories across frames | Employs `KalmanFilter` for motion prediction and `Hungarian` for bipartite matching |
-| **Preprocessor** | Service | Hardware-friendly input preprocessing: letterbox aspect-ratio padding, BGR-to-RGB, normalization ($1/255$), and CHW layout | Called by `InferenceService` before GPU inference |
-| **Postprocessor** | Service | Decodes raw YOLOv8 `(1, 84, 8400)` output tensors: score filtering, class argmax, coordinate unletterboxing, and NMS | Called by `InferenceService` after GPU inference |
-| **EventBus** | Service | In-process, non-blocking asynchronous Pub/Sub event dispatcher with bounded ring buffer (256 items) | Decouples video pipeline from MQTT network and SQLite disk I/O |
-| **MqttService** | Service | Asynchronous telemetry & alert publisher with per-camera topic routing, camera telemetry metrics, and offline queue | Subscribes to `EventBus`, publishes JSON payloads via `INetworkHAL` |
-| **StorageService** | Service | Embedded database persistence with bounded RAM write queue (1000 records), multi-camera schema, and batched SQLite transactions | Subscribes to `EventBus`, writes detections and alerts via `IStorageHAL` |
-| **HealthService** | Service | Periodic thermal monitoring, CPU/GPU load, per-camera runtime metrics (`CameraRuntimeMetrics`), and hardware watchdog keepalive | Interacts with `ISensorHAL` (sysfs) and `IWatchdogHAL` (`/dev/watchdog`) |
-| **ConfigService** | Service | Parses and validates `app_config.yaml`, `rules.yaml`, and DeepStream property files | Injected into all services and HALs during system initialization |
-| **LogService** | Service | Centralized thread-safe asynchronous structured logging (`spdlog`) | Sinks to stdout, rotating log files, and systemd journal |
-| **IDeepStreamHAL** | HAL | Pure virtual interface abstracting multi-camera GStreamer/DeepStream pipeline | Implemented by `JetsonDeepStreamHAL` and `MockDeepStreamHAL` |
-| **JetsonDeepStreamHAL** | HAL | Production hardware pipeline: `nvstreammux` batching, `nvinfer`, `nvtracker`, `nvmultistreamtiler`, pad probe | Interacts with NVIDIA driver, NVMM memory, and GStreamer plugins |
-| **MockDeepStreamHAL** | HAL | Simulates concurrent multi-camera video streams and detections on Host PC | Used for 100% test coverage and CI without Jetson hardware |
-| **ICameraHAL** | HAL | Physical camera capture abstraction (MIPI CSI-2 via Argus or USB V4L2) | Implemented by `JetsonCameraHAL` and `MockCameraHAL` |
-| **IGpuHAL** | HAL | CUDA runtime and TensorRT execution context abstraction | Implemented by `JetsonGpuHAL` and `MockGpuHAL` |
-| **INetworkHAL** | HAL | Network communication and MQTT transport abstraction | Implemented by `JetsonNetworkHAL` (Paho) and `MockNetworkHAL` |
-| **IStorageHAL** | HAL | Local database storage abstraction (SQLite3) | Implemented by `JetsonStorageHAL` and `MockStorageHAL` |
-| **ISensorHAL** | HAL | System hardware telemetry abstraction (SoC thermal zones, CPU/GPU load) | Implemented by `JetsonSensorHAL` and `MockSensorHAL` |
-| **IWatchdogHAL** | HAL | Hardware watchdog timer abstraction (`/dev/watchdog`) | Implemented by `JetsonWatchdogHAL` and `MockWatchdogHAL` |
+1. **Tách biệt Tiến trình Thời gian thực và Tiến trình Mạng (Multi-Process Fault & Latency Isolation)**:
+   * **`aegisd` (C++17 Real-Time Evidence Daemon)**: Chịu trách nhiệm thu nhận khung hình (Capture), quản lý vòng đệm trước sự kiện (Pre-Event Ring Buffer 30 giây), máy trạng thái ghi hình, băm mật mã SHA-256/HMAC-SHA256, ghi phân đoạn nguyên tử xuống flash, quản lý A/B OTA và giám sát Hardware Watchdog. Tuyệt đối không chứa ngăn xếp mạng phức tạp hay bộ thu gom rác (Garbage Collector).
+   * **`netagent` (Go 1.22 Connectivity & Upload Agent)**: Chịu trách nhiệm quản lý chuyển mạch đường truyền (`eth > wifi > lte`), máy trạng thái DHCP lease (T1/T2), kiểm tra sức khỏe DNS & phát hiện Captive Portal, giám sát hầm VPN WireGuard (kèm Kill-Switch), và tải lên đám mây theo từng mảnh 4 MiB có thể nối lại (Resumable Chunked Upload).
+   * **Lợi ích**: Nếu `netagent` bị treo do lỗi mạng hoặc tăng bộ nhớ khi tải lên, `systemd` sẽ khởi động lại `netagent` trong khi `aegisd` vẫn tiếp tục thu nhận và ghi bằng chứng xuống bộ nhớ flash mà không mất một khung hình nào.
+2. **Kiến trúc 3 Tầng (Application — Domain/Service — HAL) & Dependency Injection (DI)**:
+   * Toàn bộ phần cứng (Camera V4L2, POSIX Disk Storage, Linux Hardware Watchdog `/dev/watchdog`, TPM/Secure Element KeyStore, Bootloader Environment) đều được trừu tượng hóa qua các giao diện thuần ảo (`ICameraHal`, `IStorageHal`, `IWatchdogHal`, `IKeyStoreHal`, `IBootControlHal`) và tiêm vào `DeviceController` qua hàm tạo (Constructor Injection).
+3. **Không cấp phát động và Không khóa trên Đường dẫn Nóng (Zero-Allocation & Lock-Free Hot Path)**:
+   * Luồng thu nhận ảnh chuyển giao khung hình sang luồng điều phối/ghi đĩa qua vòng đệm `SpscRingBuffer` không khóa (`std::atomic` với `memory_order_acquire` / `memory_order_release`), đảm bảo độ trễ từ lúc bấm nút đến lúc bắt đầu ghi hình **$< 100\text{ ms}$**.
+4. **An toàn Mất điện Đột ngột (Power-Loss Safe Storage)**:
+   * Video được cắt thành các phân đoạn độc lập (`seg_000001.bin`, `seg_000002.bin`...). Mỗi phân đoạn và tệp `manifest.json` đều được ghi theo giao thức 4 bước: ghi vào tệp tạm `.tmp` $\rightarrow$ `fsync(fd)` $\rightarrow$ `rename()` nguyên tử $\rightarrow$ `fsync(dir_fd)`.
+5. **100% Kiểm thử Tất định trên Máy tính Cá nhân (Deterministic Host Simulation)**:
+   * Nhờ `FakeClock` và bộ `aegis_hal_sim`, toàn bộ hệ thống chạy tất định tuyệt đối thông qua lệnh `TICK <ms>` mà không cần phần cứng nhúng hay chờ thời gian thực.
 
 ---
 
-## 2. High-Level Subsystem Interactions
+## 2. Bảng Phân Rã Module & Trách Nhiệm (Module Inventory)
+
+### 2.1 Phân hệ C++17 Core Daemon (`aegisd` — thư mục [`core/`](../../core))
+
+| Module / Class | Tầng (Tier) | File Header / Source | Trách nhiệm kỹ thuật chính | Tương tác chính |
+|---|---|---|---|---|
+| **`aegisd_main.cpp`** | App Entry | [`aegisd_main.cpp`](../../core/apps/aegisd_main.cpp) | Phân tích tham số CLI (`--sim`, `--store`, `--pre-event-ms`...), cài đặt bẫy tín hiệu POSIX (`SIGINT`, `SIGTERM`), khởi tạo các HAL và chạy vòng lặp IPC | Khởi tạo `DeviceController` và các lớp `Sim*Hal` / `Linux*Hal` |
+| **`DeviceController`** | App Layer | [`device_controller.h`](../../core/include/aegis/app/device_controller.h)<br>[`device_controller.cpp`](../../core/src/app/device_controller.cpp) | Bộ điều phối trung tâm (Orchestrator): kết nối tất cả module qua DI, điều phối vòng đời thu nhận khung hình, xử lý lệnh IPC, phát sự kiện `EVT`, và thực thi quy trình tắt máy an toàn 4 pha | Sở hữu `PreEventBuffer`, `EvidenceStore`, `AuditLog`, `RecordingStateMachine`, `TriggerArbiter`, `AbSlotManager`, `WatchdogSupervisor` |
+| **`CommandProtocol`** | IPC Layer | [`command_protocol.h`](../../core/include/aegis/ipc/command_protocol.h)<br>[`command_protocol.cpp`](../../core/src/ipc/command_protocol.cpp) | Phân tích cú pháp (`parse_line()`) và định dạng phản hồi (`format_response()`) cho giao thức dòng lệnh ASCII (`TRIGGER`, `STOP`, `TICK`, `STATUS`, `VERIFY`, `OTA_*`, `QUIT`); chống tràn bộ đệm và được kiểm thử bằng `libFuzzer` | Được gọi bởi `DeviceController::handle_line()` |
+| **`RecordingStateMachine`** | Domain / Recording | [`recording_state_machine.h`](../../core/include/aegis/recording/recording_state_machine.h)<br>[`recording_state_machine.cpp`](../../core/src/recording/recording_state_machine.cpp) | Máy trạng thái hữu hạn hướng bảng (Table-Driven FSM) thuần logic, không I/O: quản lý 5 trạng thái (`Idle`, `Buffering`, `Recording`, `PostRecord`, `Fault`) và trả về danh sách `Action` | Nhận `Event` từ `DeviceController` và trả về `TransitionResult` |
+| **`TriggerArbiter`** | Domain / Trigger | [`trigger_arbiter.h`](../../core/include/aegis/trigger/trigger_arbiter.h)<br>[`trigger_arbiter.cpp`](../../core/src/trigger/trigger_arbiter.cpp) | Chống dội tín hiệu kích hoạt (`evaluate_trigger`, Debounce 50 ms) theo từng nguồn và thực thi luật ưu tiên (`Holster(40) > Button(30) > Signal(20) > Remote(10)`): ngăn nguồn ưu tiên thấp tắt phiên ghi của nguồn ưu tiên cao (`evaluate_stop`) | Được `DeviceController` tham vấn trước khi đẩy sự kiện vào FSM |
+| **`PreEventBuffer`** | Domain / Evidence | [`pre_event_buffer.h`](../../core/include/aegis/evidence/pre_event_buffer.h)<br>[`pre_event_buffer.cpp`](../../core/src/evidence/pre_event_buffer.cpp) | Vòng đệm khung hình lưu giữ 30 giây video trước sự kiện; tự động cắt bỏ các khung hình quá hạn và khi xả (`drain()`) luôn bắt đầu từ một khung hình khóa (**I-frame/Keyframe**) để bộ giải mã đọc được ngay | Nhận `Frame` khi ở trạng thái `Buffering`, xả sang `DeviceController` khi `TRIGGER` |
+| **`SegmentWriter`** | Domain / Evidence | [`segment_writer.h`](../../core/include/aegis/evidence/segment_writer.h)<br>[`segment_writer.cpp`](../../core/src/evidence/segment_writer.cpp) | Đóng gói danh sách `Frame` thành tệp nhị phân `seg_%06u.bin`, tính mã băm SHA-256 và ghi nguyên tử xuống đĩa thông qua `IStorageHal` | Được gọi bởi `EvidenceStore::append_segment()` |
+| **`EvidenceStore`** | Domain / Evidence | [`evidence_store.h`](../../core/include/aegis/evidence/evidence_store.h)<br>[`evidence_store.cpp`](../../core/src/evidence/evidence_store.cpp) | Quản lý vòng đời bằng chứng theo từng sự cố (`INC-<dev>-<ts>`): nối chuỗi băm `HashChain`, ký `HMAC-SHA256` bằng khóa phần cứng từ `IKeyStoreHal`, cập nhật `manifest.json`, thu dọn tệp `.tmp` mồ côi khi khởi động (`recover()`) và xác minh toàn vẹn (`verify_all()`) | Sử dụng `SegmentWriter`, `HashChain`, `Hmac`, `IStorageHal`, `IKeyStoreHal` |
+| **`AuditLog`** | Domain / Evidence | [`audit_log.h`](../../core/include/aegis/evidence/audit_log.h)<br>[`audit_log.cpp`](../../core/src/evidence/audit_log.cpp) | Nhật ký kiểm toán chỉ ghi nối thêm (`audit.log`), mỗi dòng liên kết mật mã với dòng trước đó qua SHA-256 (`prev_hash`), phát hiện mọi hành vi xóa dòng hoặc sửa nội dung | Ghi lại mọi sự kiện `POWER_ON`, `INCIDENT_START`, `INCIDENT_SEALED`, `OTA_*`, `SHUTDOWN` |
+| **`AbSlotManager`** | Domain / OTA | [`ab_slot_manager.h`](../../core/include/aegis/ota/ab_slot_manager.h)<br>[`ab_slot_manager.cpp`](../../core/src/ota/ab_slot_manager.cpp) | Quản lý cập nhật firmware 2 phân vùng A/B: kiểm tra SHA-256 bản cập nhật khi `stage()`, thiết lập `boot_attempts_left = 3`, giảm bộ đếm mỗi lần khởi động và **tự động rollback** về phân vùng cũ nếu quá 3 lần chưa gọi `mark_good()` | Tương tác với `IBootControlHal` và `IStorageHal` |
+| **`WatchdogSupervisor`** | Domain / Health | [`watchdog_supervisor.h`](../../core/include/aegis/health/watchdog_supervisor.h)<br>[`watchdog_supervisor.cpp`](../../core/src/health/watchdog_supervisor.cpp) | Giám sát nhịp tim (`heartbeat()`) có thời hạn (Deadline) của từng luồng (`capture`, `controller`, `writer`). Chỉ gọi `IWatchdogHal::kick()` trong `check_and_kick()` khi **tất cả** các luồng đã đăng ký đều còn sống | Bảo vệ chống treo cục bộ (livelock/deadlock một luồng) |
+| **`Sha256` / `Hmac` / `HashChain`** | Crypto Layer | [`sha256.h`](../../core/include/aegis/crypto/sha256.h), [`hmac.h`](../../core/include/aegis/crypto/hmac.h), [`hash_chain.h`](../../core/include/aegis/crypto/hash_chain.h) | Bộ thư viện mật mã tự thân (Zero external dependency): SHA-256 chuẩn FIPS 180-4, HMAC-SHA256 chuẩn RFC 2104 (kèm hàm so sánh thời gian hằng số chống tấn công định thời), và chuỗi băm nhị phân | Được dùng bởi `SegmentWriter`, `EvidenceStore`, `AuditLog`, `AbSlotManager` |
+| **`SpscRingBuffer` & `BoundedQueue`** | Util Layer | [`spsc_ring_buffer.h`](../../core/include/aegis/util/spsc_ring_buffer.h), [`bounded_queue.h`](../../core/include/aegis/util/bounded_queue.h) | Cấu trúc dữ liệu đồng thời có giới hạn bộ nhớ: vòng đệm Lock-Free SPSC (dung lượng lũy thừa của 2) và hàng đợi đa luồng MPMC hỗ trợ `kReject` / `kDropOldest` | Truyền khung hình và thông điệp nội bộ |
+| **`Result<T>` / `IClock` / `Logger`** | Common Layer | [`result.h`](../../core/include/aegis/common/result.h), [`clock.h`](../../core/include/aegis/common/clock.h), [`logger.h`](../../core/include/aegis/common/logger.h) | Kiểu trả về lỗi tường minh `Result<T>` / `Status` (thay thế C++ Exceptions), đồng hồ trừu tượng (`SystemClock` & `FakeClock`), và bộ ghi log an toàn luồng | Nền tảng dùng chung cho toàn bộ `aegis_core` |
+| **HAL Interfaces & Implementations** | HAL Layer | [`core/include/aegis/hal/*.h`](../../core/include/aegis/hal/i_storage_hal.h)<br>[`core/hal/sim/*`](../../core/hal/sim/sim_storage_hal.h)<br>[`core/hal/linux/*`](../../core/hal/linux/posix_storage_hal.h) | Cô lập hoàn toàn phần cứng Linux thực tế (`V4l2CameraHal`, `PosixStorageHal`, `LinuxWatchdogHal`) và môi trường mô phỏng có tiêm lỗi (`SimCameraHal`, `SimStorageHal`, `SimWatchdogHal`, `SimKeyStoreHal`, `SimBootControlHal`) | Được tiêm vào `DeviceController` |
+
+### 2.2 Phân hệ Go Connectivity & Upload Agent (`netagent` — thư mục [`netagent/`](../../netagent))
+
+| Package | File chính | Trách nhiệm kỹ thuật chính |
+|---|---|---|
+| **`cmd/netagent`** | [`main.go`](../../netagent/cmd/netagent/main.go) | Điểm nhập tiến trình Go, kết nối các bộ quản lý mạng, lắng nghe tín hiệu `SIGINT`/`SIGTERM` qua `signal.NotifyContext` và điều phối vòng lặp đồng bộ với `aegisd` |
+| **`internal/link`** | [`link.go`](../../netagent/internal/link/link.go) | Quản lý chuyển mạch đường truyền theo thứ tự ưu tiên `eth > wifi > lte` với **bộ lọc trễ chống dao động (Hysteresis: `RiseThreshold`, `FallThreshold`)** và chính sách hạn chế tải tự động trên mạng di động tính cước (**Metered LTE Policy** qua `AllowUpload(p Priority)`) |
+| **`internal/dnscheck`** | [`dnscheck.go`](../../netagent/internal/dnscheck/dnscheck.go) | Kiểm tra sức khỏe máy chủ phân giải DNS (Primary $\rightarrow$ Secondary failover), bộ nhớ đệm TTL, và phát hiện **Captive Portal / DNS Hijacking** (`CheckCanary`) bằng danh sách dải địa chỉ IP kỳ vọng (`ExpectedCanary`) |
+| **`internal/dhcp`** | [`dhcp.go`](../../netagent/internal/dhcp/dhcp.go) | Phân tích tệp thuê bao DHCP (`udhcpc` / `dhclient`) và vận hành máy trạng thái chuẩn RFC 2131: `BOUND` $\rightarrow$ `RENEWING` (tại mốc $T_1 = 50\%$) $\rightarrow$ `REBINDING` (tại mốc $T_2 = 87.5\%$) $\rightarrow$ `INIT` (khi hết hạn) |
+| **`internal/vpn`** | [`vpn.go`](../../netagent/internal/vpn/vpn.go) | Sinh cấu hình `wg-quick` (`RenderWGQuick`) và giám sát đường hầm **WireGuard VPN** (`Check`): theo dõi tuổi của lần bắt tay gần nhất (`MaxHandshakeAge = 3m`), tự động khởi động lại với Exponential Backoff, và thực thi **Kill-Switch** (`AllowTraffic()`) |
+| **`internal/uploader`** | [`uploader.go`](../../netagent/internal/uploader/uploader.go) | Tải tệp phân đoạn lên đám mây theo từng mảnh 4 MiB có thể nối lại (**Resumable Chunked Upload** qua `UploadSegment`): truy vấn vị trí dở dang qua `HEAD`, đẩy từng mảnh qua `PATCH` kèm mã băm `X-Chunk-SHA256`, thử lại với **Full-Jitter Exponential Backoff**, giới hạn số luồng tải song song và kiểm soát băng thông bằng thuật toán **Token Bucket** |
+| **`internal/ipc`** | [`ipc.go`](../../netagent/internal/ipc/ipc.go) | Giao tiếp hai chiều với `aegisd` qua giao thức dòng lệnh: gửi trạng thái mạng (`NET up|down`), báo cáo đã tải xong phân đoạn (`UPLOAD_ACK <inc_id> <idx>`) và tách luồng sự kiện bất đồng bộ `EVT {...}` |
+
+### 2.3 Công cụ Kiểm định Độc lập (`tools/verify_evidence.py`)
+* [`verify_evidence.py`](../../tools/verify_evidence.py): Công cụ Python độc lập (chỉ dùng thư viện chuẩn `hashlib`, `hmac`, `json`) dùng để kiểm tra ngoại tuyến toàn bộ thư mục lưu trữ bằng chứng (`audit.log`, `manifest.json`, từng tệp `seg_*.bin`, phát hiện tệp mồ côi, tính lại chuỗi băm nhị phân và chữ ký HMAC).
+
+---
+
+## 3. Sơ Đồ Kiến Trúc Tương Tác Liên Phân Hệ (System & Subsystem Interaction Diagram)
 
 ```mermaid
 flowchart TD
-    OS["OS / systemd / CLI User"] -->|"Launch binary (-c, -m)"| MAIN
-
-    subgraph APP["App Layer (Business Logic & Orchestration)"]
-        MAIN["main.cpp<br/>(CLI Parser, POSIX Signals, Bootstrapper)"]
-        MGR["EdgeAIManager<br/>(DI Container & Lifecycle Manager)"]
-        PIPE["Pipeline (Dual Mode: DeepStream / Modular)"]
-        RULE["RuleEngine (Per-Camera Spatial Rules)"]
+    subgraph EXT["Tác Nhân Bên Ngoài & Phần Cứng (External Triggers & Hardware)"]
+        TRIG_HW["Nút bấm / Cảm biến bao súng (Holster) / Tín hiệu BLE"]
+        CAM_HW["Cảm biến Camera (MIPI CSI / V4L2 / SimCameraHal)"]
+        TPM_HW["TPM 2.0 / Secure Element (Device HMAC Key)"]
+        WDG_HW["Hardware Watchdog (/dev/watchdog)"]
+        FLASH_HW["Bộ nhớ Flash eMMC / Filesystem (<store_root>)"]
     end
 
-    subgraph SERVICES["Service Layer (Platform-Independent Services)"]
+    subgraph AEGISD["Tiến Trình 1: aegisd (C++17 Real-Time Evidence Daemon)"]
         direction TB
-        subgraph ANALYTICS_SVC["Video Analytics Services"]
-            CAM_S["CameraService"]
-            INF_S["InferenceService<br/>(Preprocessor + Postprocessor)"]
-            TRK_S["TrackerService<br/>(ByteTrack: Kalman + Hungarian)"]
+        subgraph APP_TIER["Tier 1: Application & IPC Orchestration"]
+            MAIN["aegisd_main.cpp<br/>(CLI, Signal Handler)"]
+            CTRL["DeviceController<br/>(DI Orchestrator & Lifecycle)"]
+            PROTO["CommandProtocol<br/>(Line Parser / Formatter)"]
         end
 
-        subgraph BACKEND_SVC["Backend & Infrastructure Services"]
-            EBUS["EventBus (Async Pub/Sub)"]
-            MQTT_S["MqttService (Multi-Camera Telemetry)"]
-            STOR_S["StorageService (SQLite Multi-Camera DB)"]
-            HLT_S["HealthService (Watchdog & Thermal)"]
-            CFG_S["ConfigService (YAML & DeepStream Configs)"]
-            LOG_S["LogService (spdlog Async Logger)"]
+        subgraph DOMAIN_TIER["Tier 2: Domain Services & Lock-Free Primitives"]
+            RING["SpscRingBuffer<Frame><br/>(Lock-Free Acquire/Release)"]
+            PRE["PreEventBuffer<br/>(30s Circular Window, Keyframe Drain)"]
+            ARB["TriggerArbiter<br/>(50ms Debounce & Priority Rules)"]
+            FSM["RecordingStateMachine<br/>(Idle/Buffering/Recording/PostRecord/Fault)"]
+            STORE["EvidenceStore & SegmentWriter<br/>(SHA-256, HashChain, HMAC, Atomic Write)"]
+            AUDIT["AuditLog<br/>(Append-Only SHA-256 Chained Log)"]
+            OTA["AbSlotManager<br/>(A/B Slots, 3-Boot Rollback)"]
+            WDS["WatchdogSupervisor<br/>(Per-Thread Heartbeat Deadlines)"]
+        end
+
+        subgraph HAL_TIER["Tier 3: Hardware Abstraction Layer (HAL)"]
+            ICAM["ICameraHal"]
+            ISTOR["IStorageHal"]
+            IKEY["IKeyStoreHal"]
+            IBOOT["IBootControlHal"]
+            IWDG["IWatchdogHal"]
         end
     end
 
-    subgraph HALS["HAL Layer (Hardware & Framework Interfaces)"]
-        DS_H["IDeepStreamHAL<br/>(JetsonDeepStreamHAL / MockDeepStreamHAL)"]
-        CAM_H["ICameraHAL (CSI / V4L2)"]
-        GPU_H["IGpuHAL (CUDA / TensorRT)"]
-        NET_H["INetworkHAL (Paho MQTT)"]
-        STR_H["IStorageHAL (SQLite3)"]
-        SNS_H["ISensorHAL (Sysfs Sensors)"]
-        WDG_H["IWatchdogHAL (/dev/watchdog)"]
+    subgraph NETAGENT["Tiến Trình 2: netagent (Go 1.22 Connectivity & Upload Daemon)"]
+        direction TB
+        IPC_GO["internal/ipc.Client<br/>(Line Protocol & EVT Stream)"]
+        LINK_GO["internal/link.Manager<br/>(eth > wifi > lte + Hysteresis)"]
+        DHCP_GO["internal/dhcp.Lease<br/>(BOUND -> T1 Renew -> T2 Rebind)"]
+        DNS_GO["internal/dnscheck.Checker<br/>(Failover, TTL Cache, Captive Portal)"]
+        VPN_GO["internal/vpn.Supervisor<br/>(WireGuard Tunnel & Kill-Switch)"]
+        UPL_GO["internal/uploader.Uploader<br/>(4 MiB Resumable Chunks + Token Bucket)"]
     end
 
-    %% Process Bootstrapping
-    MAIN -->|"1. Instantiate & Initialize"| MGR
-    MAIN -->|"2. Run Detection Loop"| MGR
-    MAIN -->|"3. Signal Trap & Shutdown"| MGR
+    subgraph CLOUD["Hạ Tầng Đám Mây & Công Cụ Pháp Y (Cloud & Forensics)"]
+        WG_GW["WireGuard VPN Gateway"]
+        EVID_API["Evidence Cloud Ingestion API<br/>(HEAD / PATCH Resumable)"]
+        VERIFIER["tools/verify_evidence.py<br/>(Offline Chain-of-Custody Verifier)"]
+    end
 
-    %% Lifecycle & Configuration
-    MGR --> CFG_S
-    MGR --> LOG_S
-    MGR --> DS_H
-    MGR --> PIPE
-    MGR --> RULE
+    %% Connections from Hardware to HAL
+    CAM_HW --> ICAM
+    TPM_HW --> IKEY
+    WDG_HW <--> IWDG
+    FLASH_HW <--> ISTOR
+    FLASH_HW <--> IBOOT
 
-    %% Primary Multi-Camera DeepStream Flow (Production Mode)
-    PIPE --> DS_H
-    DS_H -.->|"Pad Probe Batch Metadata"| PIPE
-    PIPE --> RULE
-    PIPE --> EBUS
-    RULE --> EBUS
+    %% Internal aegisd flows
+    MAIN --> CTRL
+    TRIG_HW -->|"IPC / GPIO Event"| PROTO
+    PROTO <--> CTRL
+    ICAM -->|"read_frame()"| RING
+    RING -->|"try_pop()"| CTRL
+    CTRL -->|"Buffering state"| PRE
+    CTRL -->|"evaluate_trigger / evaluate_stop"| ARB
+    CTRL -->|"dispatch(Event)"| FSM
+    PRE -->|"drain()"| CTRL
+    CTRL -->|"append_segment / seal"| STORE
+    CTRL -->|"append()"| AUDIT
+    CTRL -->|"stage / mark_good"| OTA
+    CTRL -->|"heartbeat(thread)"| WDS
 
-    %% Modular Fallback Services Flow (Diagnostic / Single-Camera Mode)
-    PIPE -.-> CAM_S
-    CAM_S --> CAM_H
-    PIPE -.-> INF_S
-    INF_S --> GPU_H
-    PIPE -.-> TRK_S
+    STORE --> ISTOR
+    STORE --> IKEY
+    AUDIT --> ISTOR
+    OTA --> IBOOT
+    OTA --> ISTOR
+    WDS --> IWDG
 
-    %% Event Bus Async Fan-Out
-    EBUS -.->|"Async Detections"| MQTT_S
-    MQTT_S --> NET_H
-
-    EBUS -.->|"Async Detections"| STOR_S
-    STOR_S --> STR_H
-
-    EBUS -.->|"Async Alerts"| MQTT_S
-    EBUS -.->|"Async Alerts"| STOR_S
-
-    %% Health & Watchdog Keepalive
-    HLT_S --> SNS_H
-    HLT_S --> WDG_H
-    HLT_S -.->|"Async Health Telemetry"| EBUS
+    %% Inter-process & Cloud flows
+    PROTO <-->|"Unix Socket / Stdin-Stdout<br/>EVT segment_sealed / UPLOAD_ACK / NET"| IPC_GO
+    LINK_GO --> VPN_GO
+    DHCP_GO --> LINK_GO
+    DNS_GO --> LINK_GO
+    IPC_GO --> UPL_GO
+    VPN_GO -->|"AllowTraffic() Kill-Switch"| UPL_GO
+    UPL_GO -->|"Read seg_*.bin (Read-Only)"| FLASH_HW
+    UPL_GO -->|"Encrypted WireGuard Tunnel"| WG_GW --> EVID_API
+    FLASH_HW -.->|"Forensic Audit"| VERIFIER
 ```
 
 ---
 
-## 3. Communication Patterns
+## 4. Sơ Đồ Lớp & Dependency Injection (`DeviceController` Class Diagram)
 
-### 3.1 Process Bootstrapping & Signal Trapping (`main.cpp`)
-1. **Command-Line Interface**: The binary entry point `main(argc, argv)` in `src/app/main.cpp` parses runtime flags (`--config <path>`, `--mock`, `--help`, `--version`).
-2. **Signal Trapping**: Hooks POSIX signals `SIGINT` (Ctrl+C) and `SIGTERM` (systemd daemon termination) to static method `EdgeAIManager::signalHandler()`, writing to an atomic boolean flag (`stop_requested`) without blocking.
-3. **RAII Lifecycle**: Instantiates `EdgeAIManager` on the stack, ensuring automatic resource cleanup upon scope exit.
-4. **Error Handling & Exit Codes**: Coordinates `app.initialize()`, `app.run()`, and `app.shutdown()`, returning exit code `0` on clean completion or code `1` upon fatal initialization failure.
+Sơ đồ dưới đây thể hiện cách [`DeviceController`](../../core/include/aegis/app/device_controller.h) sở hữu các dịch vụ miền giá trị và phụ thuộc hoàn toàn vào các giao diện trừu tượng (Dependency Inversion Principle — `ADR-0001`):
 
-### 3.2 Primary Path: Asynchronous DeepStream Pad Probe Callback
-1. DeepStream executes natively in hardware GStreamer streaming threads (zero-copy NVMM memory).
-2. A buffer probe (`GST_PAD_PROBE_TYPE_BUFFER`) on the `nvtracker` source pad intercepts `NvDsBatchMeta`.
-3. For each frame in the batch:
-   * Maps `frame_meta->source_id` to the corresponding `camera_id` (e.g. `0` $\to$ `cam_01`, `1` $\to$ `cam_02`).
-   * Extracts detections, labels, and tracking IDs into a `PipelineResult`.
-   * Invokes `Pipeline::onDeepStreamMetadata()`, which evaluates rules per camera and dispatches events to `EventBus`.
+```mermaid
+classDiagram
+    class DeviceController {
+        -DeviceConfig config_
+        -IClock& clock_
+        -FakeClock* fake_clock_
+        -ICameraHal& camera_hal_
+        -IStorageHal& storage_hal_
+        -IWatchdogHal& watchdog_hal_
+        -SpscRingBuffer~Frame~ capture_ring_
+        -PreEventBuffer pre_event_buffer_
+        -EvidenceStore evidence_store_
+        -AuditLog audit_log_
+        -RecordingStateMachine state_machine_
+        -TriggerArbiter trigger_arbiter_
+        -AbSlotManager ota_manager_
+        -WatchdogSupervisor watchdog_supervisor_
+        +start() Status
+        +handle(Command) Response
+        +handle_line(string_view) string
+        +shutdown() Status
+    }
 
-### 3.3 Modular Fallback Path: Service-Level Pipeline
-When running in diagnostic or single-camera mode without DeepStream:
-1. `CameraService` grabs a `cv::Mat` frame from `ICameraHAL`.
-2. `InferenceService` uses `Preprocessor` to letterbox and normalize the frame, runs GPU inference via `IGpuHAL`, and parses bounding boxes via `Postprocessor`.
-3. `TrackerService` updates Kalman trajectories and performs Hungarian association.
-4. Results are pushed to `RuleEngine` and published to `EventBus`.
+    class IClock {
+        <<interface>>
+        +now_ms() uint64_t*
+    }
+    class ICameraHal {
+        <<interface>>
+        +read_frame() Result~Frame~*
+    }
+    class IStorageHal {
+        <<interface>>
+        +write_file_atomic(rel_path, data, len) Status*
+        +append_line(rel_path, line) Status*
+        +read_file(rel_path) Result~vector~uint8_t~~*
+        +list_dirs(rel_dir) Result~vector~string~~*
+        +list_files(rel_dir) Result~vector~string~~*
+        +remove_file(rel_path) Status*
+        +mkdir_p(rel_dir) Status*
+    }
+    class IWatchdogHal {
+        <<interface>>
+        +start(timeout_ms) Status*
+        +kick() Status*
+        +stop() Status*
+    }
+    class IKeyStoreHal {
+        <<interface>>
+        +get_device_hmac_key() Result~vector~uint8_t~~*
+    }
+    class IBootControlHal {
+        <<interface>>
+        +load_state() Result~BootSlotState~*
+        +save_state(BootSlotState) Status*
+    }
 
-### 3.4 Non-Blocking Event Bus Distribution
-* The probe thread or pipeline worker spends $< 0.05\text{ ms}$ pushing events into the thread-safe `EventBus` queue.
-* Dedicated worker threads deliver events to `MqttService` and `StorageService` asynchronously.
-* Neither network latency nor disk writes ever block frame processing or cause dropped video frames.
+    class RecordingStateMachine {
+        -State state_
+        -uint64_t segment_duration_ms_
+        -uint64_t post_record_ms_
+        +dispatch(Event) TransitionResult
+    }
 
-### 3.5 Periodic Hardware Monitoring & Watchdog
-* `HealthService` executes every 30 seconds on a timer thread:
-  1. Inspects SoC thermal zones and CPU/GPU utilization via `ISensorHAL`.
-  2. Measures per-camera performance metrics (`CameraRuntimeMetrics`: `input_fps`, `processed_fps`, `dropped_frames`, `last_pts`, `decode_latency_ms`).
-  3. Kicks Linux kernel `/dev/watchdog` via `IWatchdogHAL` (`ioctl(fd, WDIOC_KEEPALIVE, 0)`).
-  4. Publishes enriched `HealthStatus` events to `EventBus` for multi-channel cloud telemetry.
+    class TriggerArbiter {
+        -uint64_t debounce_ms_
+        -optional~TriggerSource~ active_source_
+        +evaluate_trigger(src, now_ms) ArbiterDecision
+        +evaluate_stop(src, now_ms) ArbiterDecision
+    }
 
-### 3.6 Safe Ordered Shutdown Lifecycle
-The system enforces an ordered 4-phase shutdown protocol:
-1. **Stop Video Ingress**: Stop GStreamer streaming and DeepStream HAL first, preventing new frames from entering the pipeline.
-2. **Drain Bounded Event Queue**: `EventBus::stop()` drains remaining in-flight events completely before stopping dispatch.
-3. **Commit Persistent State & Network Teardown**: `StorageService::shutdown()` commits batched SQLite transactions; `MqttService::disconnect()` disengages network sockets.
-4. **Hardware Watchdog Safe Release**: `HealthService::stop()` writes `'V'` to `/dev/watchdog` before closing, preventing emergency reboots during application exit.
+    class PreEventBuffer {
+        -uint64_t window_ms_
+        -deque~Frame~ frames_
+        +push(Frame) void
+        +drain() vector~Frame~
+    }
+
+    class EvidenceStore {
+        -IStorageHal& storage_
+        -IKeyStoreHal& key_store_
+        +begin_incident(start_ts_ms, src) Result~string~
+        +append_segment(id, frames) Result~ManifestSegmentEntry~
+        +seal_incident(id) Status
+        +verify_all() Status
+        +recover() Status
+    }
+
+    DeviceController --> IClock
+    DeviceController --> ICameraHal
+    DeviceController --> IStorageHal
+    DeviceController --> IWatchdogHal
+    DeviceController *-- RecordingStateMachine
+    DeviceController *-- TriggerArbiter
+    DeviceController *-- PreEventBuffer
+    DeviceController *-- EvidenceStore
+    EvidenceStore --> IStorageHal
+    EvidenceStore --> IKeyStoreHal
+```
 
 ---
 
-## 4. Process Lifecycle & Bootstrapping Sequence
+## 5. Biểu Đồ Tuần Tự Cho Các Luồng Nghiệp Vụ Cốt Lõi (Core Sequence Diagrams)
 
-The following sequence details how the process transitions from operating system launch (via CLI or systemd) through initialization, runtime processing, signal interception, and final teardown:
+### 5.1 Luồng Ghi Hình Khẩn Cấp, Đóng Gói Bằng Chứng & Tải Lên Đám Mây
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor OS as OS / systemd / User
-    participant MAIN as main() Entry Point
-    participant MGR as EdgeAIManager
-    participant HAL as DeepStream HAL
-    participant BUS as EventBus
-    participant PIPE as Multi-Camera Pipeline
+    participant Sensor as SimCameraHal / V4L2
+    participant Ctrl as DeviceController
+    participant PreBuf as PreEventBuffer (30s)
+    participant Arb as TriggerArbiter
+    participant FSM as RecordingStateMachine
+    participant Store as EvidenceStore + SegmentWriter
+    participant Audit as AuditLog
+    participant Net as Go netagent (Uploader)
 
-    OS->>MAIN: Execute binary (argv flags: -c, -m)
-    activate MAIN
-    MAIN->>MAIN: Parse CLI options & Install POSIX signal handlers
-    MAIN->>MGR: Instantiate app instance on stack
-    MAIN->>MGR: app.initialize(config_path, use_mock_hal)
-    activate MGR
-    MGR->>HAL: Initialize DeepStream HAL (nvstreammux batch=2)
-    MGR->>BUS: Wire subscribers & start EventBus worker
-    MGR->>PIPE: pipeline_->start()
-    MGR-->>MAIN: Return true (Initialized)
-    deactivate MGR
+    Note over Sensor,PreBuf: Giai đoạn 1: Luôn chạy nền ở trạng thái Buffering
+    loop Mỗi chu kỳ khung hình (30 FPS)
+        Sensor->>Ctrl: read_frame() -> Frame{seq, ts_ms, keyframe}
+        Ctrl->>PreBuf: push(Frame) (cắt bỏ frame cũ > 30s)
+    end
 
-    MAIN->>MGR: app.run()
-    activate MGR
-    Note over MGR,PIPE: Main thread sleeps 50ms per iteration.<br/>GStreamer & CUDA execute on hardware threads.
+    Note over Ctrl,Audit: Giai đoạn 2: Kích hoạt từ bao súng (TRIGGER holster) < 100ms
+    Ctrl->>Arb: evaluate_trigger(kHolster, now_ms)
+    Arb-->>Ctrl: kAccepted (ghi nhận active_source = kHolster)
+    Ctrl->>FSM: dispatch(Event::Trigger("holster"))
+    FSM-->>Ctrl: State=Recording, Actions=[kBeginIncident, kFlushPreEventBuffer]
+    Ctrl->>Store: begin_incident(now_ms, "holster")
+    Ctrl->>PreBuf: drain() (lấy từ I-frame đầu tiên)
+    PreBuf-->>Ctrl: vector<Frame> (30 giây video trước sự kiện)
+    Ctrl->>Audit: append("INCIDENT_START", "incident=INC-...,src=holster")
 
-    OS->>MAIN: Send SIGINT (Ctrl+C) or SIGTERM (systemctl stop)
-    MAIN->>MGR: signalHandler() sets stop_requested = true
-    Note over MGR: Next loop check detects stop_requested == true
-    MGR-->>MAIN: Exit run() loop
-    deactivate MGR
+    Note over Ctrl,Net: Giai đoạn 3: Cắt phân đoạn định kỳ (mỗi 10 giây) & Phát sự kiện EVT
+    Ctrl->>FSM: dispatch(Event::Tick(elapsed_ms))
+    FSM-->>Ctrl: Actions=[kCutSegment]
+    Ctrl->>Store: append_segment(incident_id, current_segment_frames_)
+    Store->>Store: SHA-256(seg_000001.bin) + HashChain.next() + HMAC-SHA256
+    Store->>Store: write_file_atomic(seg_000001.bin) & write_file_atomic(manifest.json)
+    Store-->>Ctrl: ManifestSegmentEntry{index=1, sha256, chain}
+    Ctrl-->>Net: EVT {"type":"segment_sealed","incident":"INC-...","index":1,"path":"..."}
 
-    MAIN->>MGR: app.shutdown()
-    activate MGR
-    Note over MGR: Executes 4-phase safe shutdown sequence
-    MGR-->>MAIN: All services cleanly terminated
-    deactivate MGR
+    Note over Ctrl,Net: Giai đoạn 4: Thử tắt từ nguồn ưu tiên thấp (STOP remote) -> Bị từ chối
+    Ctrl->>Arb: evaluate_stop(kRemote, now_ms)
+    Arb-->>Ctrl: kRejectedLowerPriority (Priority(Remote=10) < Priority(Holster=40))
 
-    MAIN-->>OS: Return exit code 0
-    deactivate MAIN
+    Note over Ctrl,Net: Giai đoạn 5: Kết thúc ghi hình (STOP holster) + Post-Record 5 giây
+    Ctrl->>Arb: evaluate_stop(kHolster, now_ms)
+    Arb-->>Ctrl: kAccepted
+    Ctrl->>FSM: dispatch(Event::Stop("holster"))
+    FSM-->>Ctrl: State=PostRecord, Actions=[kEnterPostRecord]
+    Ctrl->>FSM: dispatch(Event::Tick(5000 ms))
+    FSM-->>Ctrl: State=Buffering, Actions=[kCutSegment, kSealIncident]
+    Ctrl->>Store: seal_incident(incident_id) (sealed=true, HMAC chốt hạ)
+    Ctrl->>Audit: append("INCIDENT_SEALED", "incident=INC-...,segments=N")
+    Ctrl-->>Net: EVT {"type":"incident_sealed","incident":"INC-...","segments":N}
+
+    Note over Net,Ctrl: Giai đoạn 6: Tải lên qua hầm WireGuard VPN & Xác nhận UPLOAD_ACK
+    Net->>Net: Kiểm tra vpn.AllowTraffic() & link.AllowUpload(p)
+    Net->>Net: UploadSegment(INC-..., 1, data) (HEAD offset -> PATCH 4MiB chunks)
+    Net->>Ctrl: UPLOAD_ACK INC-AEG-0001-... 1
+    Ctrl->>Audit: append("UPLOAD_ACK", "incident=INC-...,seg=1")
 ```
 
+### 5.2 Luồng Cập Nhật A/B OTA và Tự Động Rollback Khi Boot Lỗi (`ADR-0004`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as OTA Client / IPC
+    participant Ctrl as DeviceController
+    participant Ota as AbSlotManager
+    participant BootHal as IBootControlHal (slot_state.json)
+    participant StorHal as IStorageHal
+
+    Note over Client,StorHal: Pha 1: Tải và kiểm tra chữ ký/mã băm bản cập nhật vào phân vùng phụ (Slot B)
+    Client->>Ctrl: OTA_STAGE /tmp/fw_v2.bin <expected_sha256>
+    Ctrl->>Ota: stage("/tmp/fw_v2.bin", expected_sha256)
+    Ota->>StorHal: read_file("/tmp/fw_v2.bin")
+    Ota->>Ota: Sha256::hash_hex(image) == expected_sha256 ?
+    alt Mã băm KHÔNG khớp
+        Ota-->>Ctrl: Status::Error(kIntegrityError, "SHA-256 mismatch")
+        Ctrl-->>Client: ERR INTEGRITY_ERROR OTA image SHA-256 mismatch
+    else Mã băm hợp lệ
+        Ota->>BootHal: save_state({active="A", pending="B", attempts_left=3, marked_good=false})
+        Ota-->>Ctrl: Status::Ok()
+        Ctrl-->>Client: OK {"slot":"A","pending_slot":"B","boot_attempts_left":3}
+    end
+
+    Note over Client,StorHal: Pha 2: Khởi động lại vào Slot B nhưng daemon gặp lỗi trước khi gọi OTA_MARK_GOOD
+    loop Lần khởi động thử 1, 2, 3 (chưa gọi OTA_MARK_GOOD)
+        Client->>Ctrl: OTA_REBOOT
+        Ctrl->>Ota: on_boot()
+        Ota->>BootHal: Giảm attempts_left (3 -> 2 -> 1 -> 0), chuyển active="B"
+    end
+
+    Note over Client,StorHal: Pha 3: Lần khởi động thứ 4 khi attempts_left == 0 và !marked_good -> Tự động Rollback
+    Client->>Ctrl: OTA_REBOOT
+    Ctrl->>Ota: on_boot()
+    Ota->>BootHal: Phát hiện attempts_left == 0 && !marked_good -> Khôi phục active="A", pending=""
+    Ota-->>Ctrl: Status::Ok() (Đã quay về Slot A an toàn)
+    Ctrl-->>Client: OK {"slot":"A","pending_slot":"","boot_attempts_left":0,"marked_good":true}
+```
+
+---
+
+## 6. Ma Trận Truy Vết Yêu Cầu Hệ Thống (Requirements Traceability Matrix)
+
+| Mã Yêu Cầu | Nội Dung Yêu Cầu | Phân Hệ Thực Thi (HLD) | Cơ Chế Kiểm Chứng |
+|---|---|---|---|
+| **R1** | Lưu giữ 30 giây video trước khi bấm nút (Pre-event buffer), bắt đầu từ Keyframe | `SpscRingBuffer<Frame>` + `PreEventBuffer::drain()` | [`test_pre_event_buffer.cpp`](../../core/tests/unit/test_pre_event_buffer.cpp), [`test_system_e2e.py`](../../tests/system/test_system_e2e.py) |
+| **R2** | Độ trễ từ lúc kích hoạt đến khi bắt đầu ghi $< 100\text{ ms}$; phân quyền ưu tiên nguồn kích hoạt | `TriggerArbiter` + `RecordingStateMachine` (không I/O trên luồng capture) | [`test_trigger_arbiter.cpp`](../../core/tests/unit/test_trigger_arbiter.cpp), [`test_recording_state_machine.cpp`](../../core/tests/unit/test_recording_state_machine.cpp) |
+| **R3** | Chuỗi bảo toàn bằng chứng (Chain of Custody): phát hiện mọi sửa đổi/xóa phân đoạn hoặc nhật ký | `Sha256` + `HashChain` + `Hmac` (`manifest.json`) + `AuditLog` + `verify_evidence.py` | [`test_sha256.cpp`](../../core/tests/unit/test_sha256.cpp), [`test_hmac.cpp`](../../core/tests/unit/test_hmac.cpp), [`test_audit_log.cpp`](../../core/tests/unit/test_audit_log.cpp), [`test_system_e2e.py`](../../tests/system/test_system_e2e.py) |
+| **R4** | An toàn khi rút pin / mất nguồn đột ngột giữa lúc đang ghi | `SegmentWriter` + `PosixStorageHal::write_file_atomic` (`.tmp` + `fsync` + `rename`) + `EvidenceStore::recover()` | [`test_device_controller.cpp`](../../core/tests/integration/test_device_controller.cpp) |
+| **R5** | Hoạt động Offline-first, tự động chuyển mạch mạng, kiểm tra DNS/DHCP, bọc qua VPN WireGuard và tải lên nối lại | Go `netagent`: `internal/link`, `internal/dnscheck`, `internal/dhcp`, `internal/vpn`, `internal/uploader` | `netagent/internal/*/*_test.go` |
+| **R6** | Cập nhật OTA phân vùng kép A/B và tự động rollback khi firmware mới lỗi | `AbSlotManager` + `IBootControlHal` (`boot_attempts_left = 3`) | [`test_ab_slot_manager.cpp`](../../core/tests/unit/test_ab_slot_manager.cpp), [`test_system_e2e.py`](../../tests/system/test_system_e2e.py) |
+| **R7** | Vận hành ổn định 24/7, chống treo một luồng và giới hạn bộ nhớ | `WatchdogSupervisor` + `LinuxWatchdogHal` + `BoundedQueue` / `SpscRingBuffer` | [`test_spsc_ring_buffer.cpp`](../../core/tests/unit/test_spsc_ring_buffer.cpp), [`test_bounded_queue.cpp`](../../core/tests/unit/test_bounded_queue.cpp) |
+| **R8** | Kiểm thử tự động toàn diện trên máy tính cá nhân không cần phần cứng | `aegis_hal_sim` + `FakeClock` + `TICK` command | Toàn bộ `ctest`, `go test -race`, `pytest` trong [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) |
 

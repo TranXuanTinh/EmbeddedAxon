@@ -1,282 +1,158 @@
-# Software Design Document (SWDD)
-## Project: Multi-Camera Edge AI Video Analytics on Jetson with NVIDIA DeepStream SDK
+# Software Design Document (SWDD) — AegisCam Platform
+## Modular Software Architecture, HAL Interface Contracts, Dependency Injection & IPC Specification
+
+Tài liệu **Software Design Document (SWDD)** này mô tả cấu trúc tổ chức mã nguồn, hợp đồng giao diện phần cứng (HAL Contracts), cơ chế tiêm phụ thuộc (Dependency Injection), đặc tả giao thức truyền thông liên tiến trình (IPC Line Protocol), và kiến trúc kiểm thử tự động của **AegisCam**.
 
 ---
 
-## 1. Package Structure & Modular Decomposition
-
-The project source code is arranged into 3 clean architectural tiers with strict separation of concerns:
+## 1. Cấu Trúc Thư Mục & Phân Rã Gói Phần Mềm (Package Structure)
 
 ```
-src/
-├── app/                  # Tier 1: Application Layer (Business Logic & Orchestration)
-│   ├── main.cpp          # CLI entry point, argument parsing, POSIX signals
-│   ├── edge_ai_manager   # Master orchestrator & Dependency Injection container
-│   ├── pipeline          # Dual-mode pipeline coordinator (DeepStream / Modular Services)
-│   ├── rule_engine       # Multi-Camera domain detection and counting engine
-│   └── rules/            # Concrete rules: zone_rule, counting_rule
+aegiscam/
+├── core/                                   # C++17 Real-Time Evidence Daemon (aegisd)
+│   ├── apps/
+│   │   └── aegisd_main.cpp                 # CLI parser, POSIX signal handlers, DI bootstrapper
+│   ├── include/aegis/
+│   │   ├── app/device_controller.h         # Top-level orchestrator & command dispatcher
+│   │   ├── common/                         # Result<T>/Status, IClock/FakeClock, thread-safe Logger
+│   │   ├── util/                           # Lock-free SpscRingBuffer<T>, MPMC BoundedQueue<T>
+│   │   ├── crypto/                         # FIPS 180-4 Sha256, RFC 2104 Hmac, binary HashChain
+│   │   ├── hal/                            # Pure abstract HAL interfaces (ICameraHal, IStorageHal, ...)
+│   │   ├── evidence/                       # Frame, PreEventBuffer, SegmentWriter, EvidenceStore, AuditLog
+│   │   ├── recording/                      # Table-driven RecordingStateMachine
+│   │   ├── trigger/                        # Debounced priority TriggerArbiter
+│   │   ├── ota/                            # A/B slot manager with boot-counter rollback
+│   │   ├── health/                         # Per-thread deadline WatchdogSupervisor
+│   │   └── ipc/                            # Fuzz-tested CommandProtocol parser & formatter
+│   ├── src/                                # Module implementations (.cpp)
+│   ├── hal/
+│   │   ├── sim/                            # Host simulation HALs with fault injection
+│   │   └── linux/                          # Target Linux HALs (V4L2, POSIX fsync, /dev/watchdog)
+│   ├── tests/
+│   │   ├── unit/                           # 11 GoogleTest unit test suites
+│   │   └── integration/                    # Full DeviceController integration & power-loss tests
+│   └── fuzz/
+│       └── fuzz_command_protocol.cpp       # Clang libFuzzer target
 │
-├── service/              # Tier 2: Service Layer (Platform-Independent Services)
-│   ├── camera_service    # Video capture lifecycle & frame acquisition (wraps ICameraHAL)
-│   ├── inference_service # Deep learning inference pipeline (wraps IGpuHAL + Pre/Post)
-│   ├── tracker_service   # ByteTrack multi-object tracking (KalmanFilter + Hungarian)
-│   ├── preprocessor      # Aspect-ratio preserving letterbox, RGB conversion, normalization
-│   ├── postprocessor     # YOLOv8 tensor parsing (1, 84, 8400), NMS, un-letterboxing
-│   ├── kalman_filter     # 8D state vector Kalman Filter for bounding box tracking
-│   ├── hungarian         # Munkres/Hungarian bipartite matching algorithm
-│   ├── event_bus         # In-process lock-free asynchronous Pub/Sub dispatcher
-│   ├── mqtt_service      # Multi-camera telemetry & alert publishing (wraps INetworkHAL)
-│   ├── storage_service   # SQLite ring buffer persistence (wraps IStorageHAL)
-│   ├── health_service    # Watchdog keepalive & thermal monitor (wraps ISensorHAL, IWatchdogHAL)
-│   ├── config_service    # YAML loader & DeepStream config validator
-│   └── log_service       # Asynchronous thread-safe structured logger (spdlog)
+├── netagent/                               # Go 1.22 Connectivity, VPN & Resumable Upload Daemon
+│   ├── cmd/netagent/main.go                # Daemon entrypoint & signal lifecycle
+│   └── internal/
+│       ├── link/                           # eth > wifi > lte hysteresis failover & metered policy
+│       ├── dhcp/                           # udhcpc/dhclient parser & T1/T2 lease state machine
+│       ├── dnscheck/                       # Primary/secondary DNS failover & captive-portal canary
+│       ├── vpn/                            # WireGuard config renderer, handshake monitor, kill-switch
+│       ├── uploader/                       # Resumable 4 MiB chunked uploader + token bucket
+│       └── ipc/                            # Line-protocol client & async EVT stream reader
 │
-└── hal/                  # Tier 3: Hardware Abstraction Layer (Target Drivers & Mocks)
-    ├── jetson/           # Concrete Jetson implementations
-    │   ├── jetson_deepstream_hal.cpp (nvstreammux, nvinfer, nvtracker, pad probe)
-    │   ├── jetson_camera_hal.cpp     (Hardware CSI nvarguscamerasrc / V4L2)
-    │   ├── jetson_gpu_hal.cpp        (CUDA runtime & TensorRT engine context)
-    │   ├── jetson_network_hal.cpp    (Paho MQTT C library)
-    │   ├── jetson_storage_hal.cpp    (SQLite3 C API)
-    │   ├── jetson_sensor_hal.cpp     (Linux /sys thermal zones & CPU/GPU load)
-    │   └── jetson_watchdog_hal.cpp   (Linux /dev/watchdog ioctl)
-    └── mock/             # Mock HALs for 100% Host PC Unit Testing without hardware
-        ├── mock_deepstream_hal.h     (Concurrent multi-camera simulation)
-        ├── mock_camera_hal.h         (Synthetic frame generator)
-        ├── mock_gpu_hal.h            (Synthetic bounding box generator)
-        ├── mock_network_hal.h        (In-memory message capture)
-        ├── mock_storage_hal.h        (In-memory key/value store)
-        ├── mock_sensor_hal.h         (Simulated thermal metrics)
-        └── mock_watchdog_hal.h       (Watchdog kick recorder)
+├── tools/verify_evidence.py                # Standalone forensic chain-of-custody verifier
+└── tests/system/                           # Black-box pytest E2E test suite driving `aegisd --sim`
 ```
 
 ---
 
-## 2. Application Entry Point & CLI Specification (`main.cpp`)
+## 2. Hợp Đồng Giao Diện Trừu Tượng Phần Cứng (HAL Interface Contracts)
 
-The system entry point is located in `src/app/main.cpp`. It acts as the process bootstrapper, command-line interface (CLI) parser, POSIX signal trap handler, and runtime lifecycle controller:
+Toàn bộ 5 giao diện trong [`core/include/aegis/hal/`](../../core/include/aegis/hal/i_storage_hal.h) là các lớp cơ sở thuần ảo (Pure Abstract Classes) không chứa biến thành viên:
+
+### 2.1 `ICameraHal` ([`i_camera_hal.h`](../../core/include/aegis/hal/i_camera_hal.h))
+```cpp
+class ICameraHal {
+ public:
+  virtual ~ICameraHal() = default;
+  virtual Result<evidence::Frame> read_frame() = 0;
+};
+```
+* **Bản thực thi Linux (`V4l2CameraHal`)**: Đọc khung hình từ `/dev/video0` qua vùng nhớ `V4L2_MEMORY_MMAP`.
+* **Bản mô phỏng (`SimCameraHal`)**: Dựa trên thời gian hiện tại của `FakeClock` và tốc độ `fps` (mặc định 30 FPS), sinh ra chuỗi khung hình tất định với `keyframe = (seq % 30 == 0)`.
+
+### 2.2 `IStorageHal` ([`i_storage_hal.h`](../../core/include/aegis/hal/i_storage_hal.h))
+```cpp
+class IStorageHal {
+ public:
+  virtual ~IStorageHal() = default;
+  virtual Status write_file_atomic(std::string_view rel_path,
+                                   const uint8_t* data, std::size_t len) = 0;
+  Status write_file_atomic(std::string_view rel_path, std::string_view content);
+  Status write_file_atomic(std::string_view rel_path,
+                           const std::vector<uint8_t>& data);
+  virtual Status append_line(std::string_view rel_path,
+                             std::string_view line) = 0;
+  virtual Result<std::vector<uint8_t>> read_file(std::string_view rel_path) = 0;
+  Result<std::string> read_text(std::string_view rel_path);
+  virtual bool exists(std::string_view rel_path) const = 0;
+  virtual Result<std::vector<std::string>> list_dirs(
+      std::string_view rel_dir) const = 0;
+  virtual Result<std::vector<std::string>> list_files(
+      std::string_view rel_dir) const;
+  virtual Status remove_file(std::string_view rel_path);
+  virtual Status mkdir_p(std::string_view rel_dir) = 0;
+  virtual std::string root_dir() const = 0;
+};
+```
+* **Bản thực thi Linux (`PosixStorageHal`)**: Thực thi giao thức 5 bước `.tmp` + `fsync(fd)` + `rename()` + `fsync(dir_fd)` đảm bảo tính nguyên tử ngay cả khi mất nguồn.
+* **Bản mô phỏng (`SimStorageHal`)**: Hỗ trợ thêm các phương thức tiêm lỗi kiểm thử (Fault Injection):
+  * `set_fail_next_write(true)`: Giả lập lỗi I/O ở đúng lần ghi kế tiếp.
+  * `set_disk_full(true)`: Giả lập tình huống đầy bộ nhớ Flash để kiểm tra nhánh chuyển sang trạng thái `Fault`.
+
+### 2.3 `IWatchdogHal`, `IKeyStoreHal` & `IBootControlHal`
+* **[`IWatchdogHal`](../../core/include/aegis/hal/i_watchdog_hal.h)**: `start(timeout_ms)`, `kick()`, `stop()` (`LinuxWatchdogHal::stop()` ghi ký tự Magic Close `'V'` vào `/dev/watchdog`).
+* **[`IKeyStoreHal`](../../core/include/aegis/hal/i_key_store_hal.h)**: `get_device_hmac_key()` trả về khóa bí mật ký `manifest.json` (từ TPM 2.0 hoặc khóa mô phỏng).
+* **[`IBootControlHal`](../../core/include/aegis/hal/i_boot_control_hal.h)**: `load_state()` và `save_state(BootSlotState)` quản lý phân vùng `active_slot`, `pending_slot`, `boot_attempts_left`, `marked_good`.
+
+---
+
+## 3. Khởi Tạo Dependency Injection & Quản Lý Vòng Đời (`aegisd_main.cpp`)
+
+Toàn bộ các đối tượng HAL và `DeviceController` được khởi tạo trực tiếp trên **Stack (RAII)** trong hàm `main()`, không sử dụng biến toàn cục phức tạp hay cấp phát con trỏ thô (`new`/`delete`):
 
 ```cpp
-int main(int argc, char* argv[]) {
-    std::string config_path = "config/app_config.yaml";
-    bool use_mock_hal = false;
+aegis::common::FakeClock fake_clock(1700000000000ULL);
+aegis::hal::sim::SimCameraHal camera_hal(fake_clock, config.fps, 30);
+aegis::hal::sim::SimStorageHal storage_hal(store_dir);
+aegis::hal::sim::SimWatchdogHal watchdog_hal;
+aegis::hal::sim::SimKeyStoreHal key_store_hal;
+aegis::hal::sim::SimBootControlHal boot_control_hal(storage_hal);
 
-    // 1. Parse Command-Line Options
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if ((arg == "--config" || arg == "-c") && i + 1 < argc) {
-            config_path = argv[++i];
-        } else if (arg == "--mock" || arg == "-m") {
-            use_mock_hal = true;
-        } else if (arg == "--help" || arg == "-h") {
-            printUsage();
-            return 0;
-        } else if (arg == "--version" || arg == "-v") {
-            printVersion();
-            return 0;
-        }
-    }
-
-    // 2. Install POSIX Signal Handlers
-    std::signal(SIGINT,  edge_ai::EdgeAIManager::signalHandler);
-    std::signal(SIGTERM, edge_ai::EdgeAIManager::signalHandler);
-
-    // 3. Instantiate Application Orchestrator on Stack (RAII)
-    edge_ai::EdgeAIManager app;
-
-    // 4. Initialize Subsystems & Services
-    if (!app.initialize(config_path, use_mock_hal)) {
-        std::cerr << "[Fatal Error] EdgeAIManager failed to initialize.\n";
-        return 1;
-    }
-
-    // 5. Enter Multi-Camera Processing Loop
-    app.run();
-
-    // 6. Execute Deterministic Graceful Teardown
-    app.shutdown();
-
-    return 0;
-}
-```
-
-### 2.1 CLI Arguments Reference
-
-| Option | Long Option | Argument | Default Value | Description |
-|---|---|---|---|---|
-| `-c` | `--config` | `<file_path>` | `config/app_config.yaml` | Path to master YAML application configuration file |
-| `-m` | `--mock` | None | `false` | Run in Host PC Simulation mode using `MockDeepStreamHAL` without physical Jetson GPU/CSI hardware |
-| `-h` | `--help` | None | - | Display command-line usage syntax and exit with code `0` |
-| `-v` | `--version` | None | - | Display application release version (`edge-ai-manager v1.0.0`) and exit with code `0` |
-
-### 2.2 POSIX Signal Handling Architecture
-* **Signals Trapped**: `SIGINT` (Terminal interrupt `Ctrl+C`) and `SIGTERM` (Termination request sent by `systemd` daemon upon `systemctl stop`).
-* **Atomic Flag (`stop_requested`)**: `EdgeAIManager::signalHandler()` writes to `std::atomic<bool> EdgeAIManager::stop_requested{true}`. This guarantees signal-safety (no memory allocation or mutex locking inside the signal handler context).
-* **Process Exit Codes**:
-  * `0`: Clean shutdown following graceful termination of all services.
-  * `1`: Fatal error during initialization (e.g. malformed YAML config, missing CSI sensor, or GStreamer pipeline failure).
-
-### 2.3 Process Lifecycle State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> Bootstrapping
-    Bootstrapping --> Terminated : --help / --version (exit 0)
-    Bootstrapping --> Initializing : Valid CLI arguments
-    Initializing --> FatalError : Init Failure (exit 1)
-    FatalError --> [*]
-    Initializing --> Running : Init Succeeded
-    Running --> StopRequested : SIGINT / SIGTERM Trapped
-    StopRequested --> ShuttingDown : Loop Break
-    ShuttingDown --> Terminated : Graceful Teardown (exit 0)
-    Terminated --> [*]
+aegis::app::DeviceController controller(
+    config, fake_clock, &fake_clock, camera_hal, storage_hal, watchdog_hal,
+    key_store_hal, boot_control_hal);
 ```
 
 ---
 
-## 3. Dependency Injection & Object Lifecycle
+## 4. Đặc Tả Giao Thức Dòng Lệnh Liên Tiến Trình (IPC Line Protocol Specification)
 
-All dependencies are instantiated in `EdgeAIManager::initialize()` and injected via constructor references, completely avoiding global state or singletons:
+Giao thức giữa `aegisd` và `netagent` (hoặc trình kiểm thử hệ thống `pytest`) là giao thức văn bản từng dòng (ASCII Line Protocol, tối đa 512 byte mỗi dòng), giúp dễ dàng gỡ lỗi bằng `socat`/`nc`, ghi nhật ký trực tiếp và kiểm thử fuzzing bằng `libFuzzer`:
 
-```cpp
-bool EdgeAIManager::initialize(const std::string& config_file, bool use_mock_hal) {
-    // 1. Load Configuration
-    config_ = std::make_unique<ConfigService>();
-    if (!config_->loadFromFile(config_file)) return false;
+### 4.1 Bảng Lệnh Yêu Cầu & Phản Hồi (`Request -> Response`)
 
-    // 2. Initialize Centralized Logger
-    LogService::init(config_->getLogLevel(), config_->getLogFile());
+| Lệnh gửi tới `aegisd` | Tham số hợp lệ | Phản hồi thành công (`OK {...}`) | Mã lỗi có thể trả về (`ERR <code> <msg>`) |
+|---|---|---|---|
+| `TRIGGER <src>` | `holster \| button \| signal \| remote` | `OK {"state":"Recording","incident":"INC-...","segments":0,"net":"up","slot":"A"}` | `INVALID_ARGUMENT`, `INVALID_STATE`, `IO_ERROR` |
+| `STOP <src>` | `holster \| button \| signal \| remote` | `OK {"state":"PostRecord","incident":"INC-...",...}` | `INVALID_STATE` (nếu ưu tiên thấp hơn nguồn mở phiên ghi) |
+| `TICK <ms>` | Số nguyên `1 .. 60000` (chỉ ở `--sim`) | `OK {"state":"...","incident":"...","segments":1,"net":"up","slot":"A"}` | `INVALID_ARGUMENT`, `NOT_SUPPORTED` |
+| `STATUS` | Không có | `OK {"state":"Buffering","incident":"","segments":0,"net":"up","slot":"A"}` | `PARSE_ERROR` (nếu thừa tham số) |
+| `VERIFY` | Không có | `OK {"verified":true,"status":"OK"}` | `INTEGRITY_ERROR` (nếu tệp phân đoạn hoặc `audit.log` bị sửa) |
+| `NET <state>` | `up \| down` | `OK {"state":"...","net":"up","slot":"A"}` | `INVALID_ARGUMENT` |
+| `UPLOAD_ACK <inc> <idx>` | `<incident_id>` và chỉ số $\ge 1$ | `OK {"state":"...","incident":"INC-...",...}` | `INVALID_ARGUMENT`, `IO_ERROR` |
+| `OTA_STAGE <path> <sha>` | Đường dẫn tệp & 64 ký tự hex | `OK {"slot":"A","pending_slot":"B","boot_attempts_left":3}` | `INTEGRITY_ERROR` (sai SHA-256), `IO_ERROR` |
+| `OTA_REBOOT` | Không có | `OK {"slot":"B","pending_slot":"B","boot_attempts_left":2,"marked_good":false}` | `IO_ERROR`, `NOT_SUPPORTED` |
+| `OTA_MARK_GOOD` | Không có | `OK {"slot":"B","marked_good":true}` | `IO_ERROR` |
+| `QUIT` | Không có | `OK {"state":"Buffering","incident":"","segments":0,"net":"up","slot":"A"}` | — |
 
-    // 3. Instantiate HALs (Jetson Production vs. Mock Host Mode)
-    if (use_mock_hal) {
-        deepstream_hal_ = std::make_unique<hal::MockDeepStreamHAL>();
-        camera_hal_     = std::make_unique<hal::MockCameraHAL>();
-        gpu_hal_        = std::make_unique<hal::MockGpuHAL>();
-        network_hal_    = std::make_unique<hal::MockNetworkHAL>();
-        storage_hal_    = std::make_unique<hal::MockStorageHAL>();
-        sensor_hal_     = std::make_unique<hal::MockSensorHAL>();
-        watchdog_hal_   = std::make_unique<hal::MockWatchdogHAL>();
-    } else {
-        deepstream_hal_ = std::make_unique<hal::JetsonDeepStreamHAL>();
-        camera_hal_     = std::make_unique<hal::JetsonCameraHAL>();
-        gpu_hal_        = std::make_unique<hal::JetsonGpuHAL>();
-        network_hal_    = std::make_unique<hal::JetsonNetworkHAL>();
-        storage_hal_    = std::make_unique<hal::JetsonStorageHAL>();
-        sensor_hal_     = std::make_unique<hal::JetsonSensorHAL>();
-        watchdog_hal_   = std::make_unique<hal::JetsonWatchdogHAL>();
-    }
-
-    // 4. Instantiate Platform-Independent Services
-    event_bus_      = std::make_unique<EventBus>(256);
-    camera_svc_     = std::make_unique<CameraService>(*camera_hal_);
-    inference_svc_  = std::make_unique<InferenceService>(*gpu_hal_);
-    tracker_svc_    = std::make_unique<TrackerService>();
-    mqtt_svc_       = std::make_unique<MqttService>(*network_hal_);
-    storage_svc_    = std::make_unique<StorageService>(*storage_hal_);
-    health_svc_     = std::make_unique<HealthService>(*sensor_hal_, *watchdog_hal_, *event_bus_);
-
-    // 5. Initialize Multi-Camera DeepStream HAL
-    if (config_->getDeepStreamConfig().enabled) {
-        deepstream_hal_->initialize(config_->getDeepStreamConfig(), config_->getCameras());
-        pipeline_ = std::make_unique<Pipeline>(*deepstream_hal_);
-    } else {
-        // Fallback: modular service-level pipeline
-        pipeline_ = std::make_unique<Pipeline>(*camera_svc_, *inference_svc_, *tracker_svc_);
-    }
-
-    // 6. Instantiate Domain Rule Engine & Connect Event Bus
-    rule_engine_ = std::make_unique<RuleEngine>(*event_bus_);
-    pipeline_->setResultCallback([this](const PipelineResult& res) {
-        onPipelineResult(res);
-    });
-
-    wireEventBus();
-    return true;
-}
-```
+### 4.2 Sự Kiện Bất Đồng Bộ (`EVT {...}`)
+Khi `aegisd` đóng gói xong một phân đoạn hoặc niêm phong toàn bộ sự cố, nó chủ động phát dòng `EVT ` tới `netagent`:
+* `EVT {"type":"segment_sealed","incident":"INC-AEG-0001-1700000000000","index":1,"path":"incidents/INC-AEG-0001-1700000000000/seg_000001.bin","sha256":"<64-hex>"}`
+* `EVT {"type":"incident_sealed","incident":"INC-AEG-0001-1700000000000","segments":3}`
 
 ---
 
-## 4. Class Design & Component Contracts
+## 5. Kiến Trúc Kiểm Thử Đa Tầng & Cổng Chất Lượng (Multi-Tier Testing Architecture)
 
-### 4.1 DeepStream Hardware Abstraction (`IDeepStreamHAL`)
-* Pure virtual contract for the multi-camera pipeline:
-  ```cpp
-  class IDeepStreamHAL {
-  public:
-      virtual ~IDeepStreamHAL() = default;
-      virtual bool initialize(const DeepStreamConfig& ds_config,
-                              const std::vector<CameraSourceConfig>& cameras) = 0;
-      virtual bool start() = 0;
-      virtual void pause() = 0;
-      virtual void resume() = 0;
-      virtual void stop() = 0;
-      virtual bool isRunning() const = 0;
-      virtual void setMetadataCallback(MetadataCallback cb) = 0;
-      virtual float getStreamFps(int source_id) const = 0;
-      virtual size_t getActiveSourceCount() const = 0;
-      virtual bool stepFrame(PipelineResult& out_result) = 0;
-  };
-  ```
+| Tầng Kiểm Thử | Công Cụ & Vị Trí File | Mục Tiêu Kiểm Chứng |
+|---|---|---|
+| **1. Unit Tests (C++17 & Go)** | GoogleTest ([`core/tests/unit/*.cpp`](../../core/tests/unit/test_recording_state_machine.cpp)) & `go test -race` (`netagent/internal/*/*_test.go`) | Kiểm chứng độc lập vector chuẩn NIST SHA-256, RFC 4231 HMAC, vòng đệm Lock-free SPSC đa luồng, FSM, TriggerArbiter, A/B OTA rollback, DHCP/DNS/VPN/Uploader |
+| **2. Integration Tests (C++17)** | [`test_device_controller.cpp`](../../core/tests/integration/test_device_controller.cpp) | Kiểm chứng sự phối hợp giữa tất cả module qua `Sim*Hal`, tiêm lỗi đĩa đầy/ghi lỗi và khả năng khôi phục sau sập nguồn (`recover()`) |
+| **3. Fuzz Testing (`libFuzzer`)** | [`fuzz_command_protocol.cpp`](../../core/fuzz/fuzz_command_protocol.cpp) | Bơm hàng triệu chuỗi byte ngẫu nhiên/độc hại vào `CommandProtocol::parse_line()` kèm ASan/UBSan để đảm bảo không bao giờ crash hoặc đọc ngoài vùng nhớ |
+| **4. System E2E Tests (`pytest`)** | [`test_system_e2e.py`](../../tests/system/test_system_e2e.py) + [`verify_evidence.py`](../../tools/verify_evidence.py) | Chạy tiến trình `aegisd --sim` như một hộp đen qua ống dẫn Stdin/Stdout, kiểm tra toàn bộ quy trình từ `TICK` $\rightarrow$ `TRIGGER` $\rightarrow$ lật 1 bit làm giả bằng chứng $\rightarrow$ bắt quả tang bằng `VERIFY` và `verify_evidence.py` |
 
-### 4.2 Modular Video Analytics Services
-* **`CameraService`**: Encapsulates single-source camera operations (`open`, `grabFrame`, `release`, `getFps`), abstracting hardware specific formats.
-* **`InferenceService`**: Encapsulates preprocessing (`Preprocessor`), hardware TensorRT engine invocation (`IGpuHAL::runInference`), and postprocessing (`Postprocessor`), outputting `std::vector<Detection>`.
-* **`TrackerService`**: Implements ByteTrack multi-object tracking associating high-confidence and low-confidence detections across consecutive frames via `KalmanFilter` and `Hungarian` solver.
-
-### 4.3 Rule Engine Polymorphism (`IRule`)
-* Abstract rule contract with camera isolation and lifecycle reset:
-  ```cpp
-  class IRule {
-  public:
-      virtual ~IRule() = default;
-      virtual std::string getId() const = 0;
-      virtual std::string getName() const = 0;
-      virtual std::string getCameraId() const = 0; // "cam_01", "cam_02", or "*"
-      virtual bool isEnabled() const = 0;
-      virtual void setEnabled(bool enabled) = 0;
-      virtual std::optional<Alert> evaluate(const std::vector<TrackedObject>& objects) = 0;
-      virtual void resetCameraState(const std::string& camera_id) = 0;
-  };
-  ```
-* **Concrete Rules**:
-  * `ZoneRule`: Detects polygon intrusion using Ray-Casting algorithm. Maintains isolated per-camera alert cooldown timers (`last_alert_time_per_cam_`) and resets timer state via `resetCameraState(camera_id)` on camera reconnect.
-  * `CountingRule`: Detects directional line crossing. Employs compound keying (`std::pair<std::string, int>` for `[camera_id, track_id]`) in `previous_side_` to eliminate cross-camera track ID collision, and purges tracking memory on reconnect via `resetCameraState(camera_id)`.
-
-### 4.4 Ordered Graceful Shutdown Sequence
-To prevent segmentation faults, dropped data, or unintended hardware watchdog reboots, `EdgeAIManager::shutdown()` coordinates a 4-phase safe teardown:
-```cpp
-void EdgeAIManager::shutdown() {
-    // 1. Stop video streaming ingestion & DeepStream pipeline (halts incoming frames)
-    if (pipeline_) pipeline_->stop();
-    if (deepstream_hal_) deepstream_hal_->stop();
-    if (camera_svc_) camera_svc_->close();
-
-    // 2. Drain and stop bounded event bus queue (ensures all in-flight metadata reaches workers)
-    if (event_bus_) event_bus_->stop();
-
-    // 3. Flush SQLite transactions and cleanly close MQTT connection
-    if (storage_svc_) storage_svc_->shutdown();
-    if (mqtt_svc_) mqtt_svc_->disconnect();
-
-    // 4. Stop health monitoring and safely close /dev/watchdog with magic character 'V'
-    if (health_svc_) health_svc_->stop();
-}
-```
-
----
-
-## 5. Testability Strategy: Host PC Development with Mock HAL
-
-* Developers can build and test the full application and all services on standard x86 Linux or Windows machines without NVIDIA Jetson hardware:
-  ```bash
-  mkdir -p build && cd build
-  cmake .. -DBUILD_TESTS=ON
-  cmake --build .
-  ctest --output-on-failure
-  ```
-* `MockDeepStreamHAL` generates synthetic frames and multi-camera detections, allowing end-to-end testing of:
-  1. Multi-camera frame stepping & pad probe callbacks.
-  2. Per-camera rule evaluation in `RuleEngine`.
-  3. JSON payload serialization with `camera_id` in `MqttService`.
-  4. SQLite schema with `camera_id` indexing in `StorageService`.
